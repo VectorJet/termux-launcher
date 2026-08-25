@@ -6873,6 +6873,17 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             mInAppKeyboard.endExternalTextInput();
     }
 
+    /**
+     * Points the embedded keyboard's single interceptor slot at the floating web overlay while it
+     * is open, or clears it with {@code null}. Caveat: another surface that installs an
+     * interceptor (command palette, rename sheets) replaces this one for its lifetime.
+     */
+    public void setWebOverlayKeyInterceptor(
+            com.termux.app.terminal.inappkeyboard.TerminalKeyEventHandler.KeyValueInterceptor interceptor) {
+        if (mInAppKeyboard != null)
+            mInAppKeyboard.setKeyValueInterceptor(interceptor);
+    }
+
     /** Restores the embedded keyboard's prior visibility and system-IME suppression. */
     public void endTerminalToolbarExternalTextInput() {
         if (mInAppKeyboard != null)
