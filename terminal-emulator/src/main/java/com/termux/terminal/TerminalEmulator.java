@@ -3158,7 +3158,8 @@ public final class TerminalEmulator {
                     Logger.logError(mClient, LOG_TAG, "OSC Manipulate selection, invalid string '" + textParameter + "'");
                 }
                 break;
-            case // Media overlay player request: "7770;<file-path-or-url>".
+            case // Web overlay request: "7770;<source>". "browse:<url>" loads a page; anything
+            // else plays as media in the overlay's WebView.
             7770:
                 if (!textParameter.isEmpty())
                     mSession.onMediaOverlayRequest(textParameter);

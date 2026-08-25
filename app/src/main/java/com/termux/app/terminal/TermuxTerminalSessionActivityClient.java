@@ -308,7 +308,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     @Override
     public void onMediaOverlayRequest(@NonNull TerminalSession session, @NonNull String source) {
         if (!mHost.isVisible()) return;
-        MediaOverlayDialog.show(mContext, source);
+        FloatingWebOverlay.show(mContext, source);
     }
 
     @Override
