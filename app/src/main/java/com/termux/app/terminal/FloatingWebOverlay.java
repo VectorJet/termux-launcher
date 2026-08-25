@@ -7,7 +7,6 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Environment;
 import android.view.Gravity;
-import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -264,7 +263,7 @@ public final class FloatingWebOverlay {
                 case Editing:
                     switch (value.getEditing()) {
                         case SPACE_BAR: sendChars(focus, " "); break;
-                        case BACKSPACE: dispatchKeyCode(focus, KeyEvent.KEYCODE_DEL); break;
+                        case BACKSPACE: sendBackspace(focus); break;
                         default: break;
                     }
                     return true;
@@ -287,11 +286,36 @@ public final class FloatingWebOverlay {
             }
         }
 
+        /**
+         * Text reaches the page through document.execCommand('insertText'), which works on any
+         * focused HTML field without needing a KeyCharacterMap; the URL bar is edited through its
+         * own text model. Control keys stay synthetic key events.
+         */
         private void sendChars(View focus, String chars) {
-            KeyCharacterMap kcm = KeyCharacterMap.get(KeyCharacterMap.VIRTUAL_KEYBOARD, 0);
-            KeyEvent[] events = kcm.getEvents(chars.toCharArray());
-            if (events == null) return;
-            for (KeyEvent event : events) focus.dispatchKeyEvent(event);
+            if (focus == mUrlBar) {
+                int start = Math.max(mUrlBar.getSelectionStart(), 0);
+                int end = Math.max(mUrlBar.getSelectionEnd(), 0);
+                mUrlBar.getText().replace(Math.min(start, end), Math.max(start, end), chars);
+            } else {
+                String escaped = chars.replace("\\", "\\\\").replace("'", "\\'")
+                    .replace("\n", "\\n");
+                mWebView.evaluateJavascript(
+                    "document.execCommand('insertText', false, '" + escaped + "');", null);
+            }
+        }
+
+        private void sendBackspace(View focus) {
+            if (focus == mUrlBar) {
+                int start = mUrlBar.getSelectionStart();
+                int end = mUrlBar.getSelectionEnd();
+                if (start == end && start > 0) {
+                    mUrlBar.getText().delete(start - 1, start);
+                } else if (start != end) {
+                    mUrlBar.getText().delete(Math.min(start, end), Math.max(start, end));
+                }
+            } else {
+                mWebView.evaluateJavascript("document.execCommand('delete');", null);
+            }
         }
 
         private void dispatchKeyCode(View focus, int keyCode) {
