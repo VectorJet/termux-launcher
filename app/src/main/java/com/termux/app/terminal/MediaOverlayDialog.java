@@ -29,14 +29,15 @@ public final class MediaOverlayDialog {
 
     /** Resolve and play $source, which may be an absolute path, a file:// or http(s) URL. */
     public static void show(Context context, String source) {
-        Activity activity = null;
-        if (context instanceof Activity) activity = (Activity) context;
+        Activity found = null;
+        if (context instanceof Activity) found = (Activity) context;
         else if (context instanceof android.content.ContextWrapper)
-            activity = findActivity((android.content.ContextWrapper) context);
-        if (activity == null || activity.isFinishing()) {
+            found = findActivity((android.content.ContextWrapper) context);
+        if (found == null || found.isFinishing()) {
             Logger.logWarn(LOG_TAG, "no usable activity for media overlay request");
             return;
         }
+        final Activity activity = found;
         Uri uri = resolve(context, source);
         if (uri == null) {
             Toast.makeText(activity, "media overlay: cannot resolve '" + source + "'", Toast.LENGTH_LONG).show();
