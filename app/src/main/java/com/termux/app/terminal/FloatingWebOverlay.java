@@ -24,6 +24,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.annotation.NonNull;
 import com.google.android.material.color.MaterialColors;
 import com.termux.R;
 import com.termux.app.TermuxActivity;
@@ -287,7 +288,7 @@ public final class FloatingWebOverlay {
         }
 
         private void sendChars(View focus, String chars) {
-            KeyCharacterMap kcm = KeyCharacterMap.get(KeyCharacterMap.VIRTUAL_KEYBOARD);
+            KeyCharacterMap kcm = KeyCharacterMap.get(KeyCharacterMap.VIRTUAL_KEYBOARD, 0);
             KeyEvent[] events = kcm.getEvents(chars.toCharArray());
             if (events == null) return;
             for (KeyEvent event : events) focus.dispatchKeyEvent(event);
