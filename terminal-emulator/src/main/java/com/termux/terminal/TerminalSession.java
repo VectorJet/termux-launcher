@@ -395,6 +395,7 @@ public final class TerminalSession extends TerminalOutput {
     }
 
     /** Called by the emulator when an "OSC 7770 ; <source>" media overlay request arrives. */
+    @Override
     public void onMediaOverlayRequest(String source) {
         mClient.onMediaOverlayRequest(this, source);
     }
