@@ -307,8 +307,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Override
     public void onMediaOverlayRequest(@NonNull TerminalSession session, @NonNull String source) {
-        if (!mActivity.isVisible()) return;
-        mActivity.runOnUiThread(() -> MediaOverlayDialog.show(mActivity, source));
+        if (!mHost.isVisible()) return;
+        MediaOverlayDialog.show(mContext, source);
     }
 
     @Override

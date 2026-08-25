@@ -2,6 +2,7 @@ package com.termux.app.terminal;
 
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.Context;
 import android.net.Uri;
 import android.os.Environment;
 import android.view.Gravity;
@@ -27,8 +28,16 @@ public final class MediaOverlayDialog {
     }
 
     /** Resolve and play $source, which may be an absolute path, a file:// or http(s) URL. */
-    public static void show(Activity activity, String source) {
-        Uri uri = resolve(activity, source);
+    public static void show(Context context, String source) {
+        Activity activity = null;
+        if (context instanceof Activity) activity = (Activity) context;
+        else if (context instanceof android.content.ContextWrapper)
+            activity = findActivity((android.content.ContextWrapper) context);
+        if (activity == null || activity.isFinishing()) {
+            Logger.logWarn(LOG_TAG, "no usable activity for media overlay request");
+            return;
+        }
+        Uri uri = resolve(context, source);
         if (uri == null) {
             Toast.makeText(activity, "media overlay: cannot resolve '" + source + "'", Toast.LENGTH_LONG).show();
             return;
@@ -59,7 +68,13 @@ public final class MediaOverlayDialog {
         video.start();
     }
 
-    private static Uri resolve(Activity activity, String source) {
+    private static Activity findActivity(android.content.ContextWrapper wrapper) {
+        android.content.Context base = wrapper.getBaseContext();
+        while (base instanceof android.content.ContextWrapper) base = ((android.content.ContextWrapper) base).getBaseContext();
+        return (base instanceof Activity) ? (Activity) base : null;
+    }
+
+    private static Uri resolve(Context context, String source) {
         if (source.startsWith("http://") || source.startsWith("https://") || source.startsWith("content://"))
             return Uri.parse(source);
         if (source.startsWith("file://"))
@@ -69,7 +84,7 @@ public final class MediaOverlayDialog {
             file = new File(Environment.getExternalStorageDirectory(), source);
         // Termux apps default to their private root; try that too before giving up.
         if (!file.exists()) {
-            File termuxRoot = new File(activity.getFilesDir().getParentFile(), "files/home", source);
+            File termuxRoot = new File(context.getFilesDir().getParentFile(), "files/home", source);
             if (termuxRoot.exists()) return Uri.fromFile(termuxRoot);
             return null;
         }
