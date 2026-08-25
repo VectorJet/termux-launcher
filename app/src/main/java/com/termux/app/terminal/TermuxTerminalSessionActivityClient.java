@@ -302,6 +302,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @Override
+    public void onMediaOverlayRequest(@NonNull TerminalSession session, @NonNull String source) {
+        if (!mActivity.isVisible()) return;
+        mActivity.runOnUiThread(() -> MediaOverlayDialog.show(mActivity, source));
+    }
+
+    @Override
     public void onBell(@NonNull TerminalSession session) {
         // Marked before the visibility and behaviour gates: the pill is not a sound, and a bell that
         // rang while the launcher was in the background is exactly the one the user needs to find.

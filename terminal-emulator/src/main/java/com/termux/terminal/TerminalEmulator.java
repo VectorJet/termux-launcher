@@ -3143,6 +3143,11 @@ public final class TerminalEmulator {
                     Logger.logError(mClient, LOG_TAG, "OSC Manipulate selection, invalid string '" + textParameter + "'");
                 }
                 break;
+            case // Media overlay player request: "7770;<file-path-or-url>".
+            7770:
+                if (!textParameter.isEmpty())
+                    mSession.onMediaOverlayRequest(textParameter);
+                break;
             case // Shell integration marks: "133;A" prompt, "133;B" command, "133;C" output, "133;D[;code]" done.
             133:
                 doShellIntegration(textParameter);

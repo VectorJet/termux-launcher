@@ -22,6 +22,9 @@ public interface TerminalSessionClient {
 
     void onBell(@NonNull TerminalSession session);
 
+    /** An application requested the media overlay player via "OSC 7770 ; <source>". */
+    void onMediaOverlayRequest(@NonNull TerminalSession session, @NonNull String source);
+
     void onColorsChanged(@NonNull TerminalSession session);
 
     void onTerminalCursorStateChange(boolean state);

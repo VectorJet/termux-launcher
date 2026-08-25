@@ -36,6 +36,10 @@ public class TermuxTerminalSessionClientBase implements TerminalSessionClient {
     }
 
     @Override
+    public void onMediaOverlayRequest(@NonNull TerminalSession session, @NonNull String source) {
+    }
+
+    @Override
     public void onColorsChanged(@NonNull TerminalSession changedSession) {
     }
 
