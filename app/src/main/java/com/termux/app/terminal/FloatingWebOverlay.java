@@ -171,6 +171,19 @@ public final class FloatingWebOverlay {
         settings.setLoadWithOverviewMode(true);
         webView.setWebViewClient(new WebViewClient());
         webView.setWebChromeClient(new WebChromeClient());
+        // A WebView inside a plain ViewGroup never wins focus on tap by itself, so the IME
+        // never shows for text fields. Claim focus on first touch and raise the keyboard.
+        webView.setFocusable(true);
+        webView.setFocusableInTouchMode(true);
+        final android.view.inputmethod.InputMethodManager imm = (android.view.inputmethod.InputMethodManager)
+            activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+        webView.setOnTouchListener((v, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN && !v.hasFocus()) {
+                v.requestFocus();
+                if (imm != null) imm.showSoftInput(v, 0);
+            }
+            return false;
+        });
         return webView;
     }
 
