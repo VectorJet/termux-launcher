@@ -84,7 +84,7 @@ public final class MediaOverlayDialog {
             file = new File(Environment.getExternalStorageDirectory(), source);
         // Termux apps default to their private root; try that too before giving up.
         if (!file.exists()) {
-            File termuxRoot = new File(context.getFilesDir().getParentFile(), "files/home", source);
+            File termuxRoot = new File(new File(context.getFilesDir().getParentFile(), "files/home"), source);
             if (termuxRoot.exists()) return Uri.fromFile(termuxRoot);
             return null;
         }
