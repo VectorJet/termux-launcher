@@ -6858,6 +6858,21 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         });
     }
 
+    /** Gives the floating web overlay's WebView ownership of the system IME while it is focused. */
+    public void beginWebOverlayTextInput(@NonNull View view) {
+        if (mInAppKeyboard != null && mInAppKeyboard.isEnabled())
+            mInAppKeyboard.beginExternalTextInput();
+        onSystemImeRequested();
+        KeyboardUtils.showSoftKeyboard(TermuxActivity.this, view);
+    }
+
+    /** Returns system-IME ownership from the web overlay to the embedded keyboard. */
+    public void endWebOverlayTextInput() {
+        if (mInAppKeyboard != null && mInAppKeyboard.isEnabled()
+            && mInAppKeyboard.isExternalTextInputActive())
+            mInAppKeyboard.endExternalTextInput();
+    }
+
     /** Restores the embedded keyboard's prior visibility and system-IME suppression. */
     public void endTerminalToolbarExternalTextInput() {
         if (mInAppKeyboard != null)

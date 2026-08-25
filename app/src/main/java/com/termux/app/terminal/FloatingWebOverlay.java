@@ -1,8 +1,10 @@
 package com.termux.app.terminal;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Environment;
 import android.view.Gravity;
@@ -14,11 +16,13 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.termux.app.TermuxActivity;
 import com.termux.shared.logger.Logger;
 
 import java.io.File;
@@ -36,6 +40,10 @@ import java.nio.charset.StandardCharsets;
  * leaves are bound to a {@link com.termux.terminal.TerminalSession} and reflow a PTY on resize,
  * none of which applies to web content. The overlay floats above everything in the activity's
  * content view and consumes its own touches, so the terminal underneath never sees them.
+ *
+ * While the WebView owns focus the system IME is handed over through the activity's
+ * external-input path, because the embedded keyboard otherwise suppresses the system IME
+ * app-wide; on blur or close ownership returns to the embedded keyboard.
  */
 public final class FloatingWebOverlay {
 
@@ -46,8 +54,18 @@ public final class FloatingWebOverlay {
     private static final int MIN_WIDTH_DP = 180;
     private static final int MIN_HEIGHT_DP = 140;
 
-    /** Bounds survive hide/show while the process lives, like the scratchpad's remembered shape. */
+    private static final int BORDER_COLOR_IDLE = 0xFF555555;
+    private static final int BORDER_COLOR_FOCUSED = 0xFF4FC3F7;
+
+    private static final String PREFS_NAME = "web_overlay_bounds";
+    private static final String KEY_LEFT = "left";
+    private static final String KEY_TOP = "top";
+    private static final String KEY_WIDTH = "width";
+    private static final String KEY_HEIGHT = "height";
+
+    /** Bounds survive hide/show for the process lifetime, and persist to prefs across restarts. */
     private static int sLeftDp = -1, sTopDp = -1, sWidthDp = -1, sHeightDp = -1;
+    private static boolean sBoundsLoaded;
 
     private FloatingWebOverlay() {
     }
@@ -57,11 +75,12 @@ public final class FloatingWebOverlay {
         if (context instanceof Activity) found = (Activity) context;
         else if (context instanceof android.content.ContextWrapper)
             found = findActivity((android.content.ContextWrapper) context);
-        if (found == null || found.isFinishing()) {
-            Logger.logWarn(LOG_TAG, "no usable activity for web overlay request");
+        if (!(found instanceof TermuxActivity)) {
+            Logger.logWarn(LOG_TAG, "web overlay requires a TermuxActivity host");
             return;
         }
-        final Activity activity = found;
+        final TermuxActivity activity = (TermuxActivity) found;
+        if (activity.isFinishing()) return;
 
         final boolean browseMode = source.startsWith("browse:");
         final String target = browseMode ? source.substring("browse:".length()) : source;
@@ -80,10 +99,11 @@ public final class FloatingWebOverlay {
 
         // Replace an existing overlay rather than stacking windows.
         for (int i = root.getChildCount() - 1; i >= 0; i--) {
-            if (root.getChildAt(i).getTag() != null && LOG_TAG.equals(root.getChildAt(i).getTag()))
+            if (LOG_TAG.equals(root.getChildAt(i).getTag()))
                 root.removeViewAt(i);
         }
 
+        loadPersistedBounds(activity);
         final int width = dp(density, clamp(sWidthDp, MIN_WIDTH_DP, screenW / density,
             Math.min(screenW, 420) / density));
         final int height = dp(density, clamp(sHeightDp, MIN_HEIGHT_DP, screenH / density,
@@ -95,7 +115,15 @@ public final class FloatingWebOverlay {
 
         final FrameLayout window = new FrameLayout(activity);
         window.setTag(LOG_TAG);
-        window.setBackgroundColor(Color.BLACK);
+        window.setClipToOutline(true);
+        window.setElevation(dp(density, 12));
+        // Border doubles as the focus indicator: gray when idle, cyan when the overlay owns input.
+        final GradientDrawable border = new GradientDrawable();
+        border.setColor(Color.BLACK);
+        border.setCornerRadius(dp(density, 8));
+        border.setStroke(Math.max(1, dp(density, 1)), BORDER_COLOR_IDLE);
+        window.setBackground(border);
+
         final FrameLayout.LayoutParams windowParams = new FrameLayout.LayoutParams(width, height);
         windowParams.leftMargin = left;
         windowParams.topMargin = top;
@@ -103,6 +131,7 @@ public final class FloatingWebOverlay {
 
         final LinearLayout column = new LinearLayout(activity);
         column.setOrientation(LinearLayout.VERTICAL);
+        column.setClipChildren(false);
         window.addView(column, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -133,11 +162,18 @@ public final class FloatingWebOverlay {
         reloadButton.setOnClickListener(v -> webView.reload());
         bar.addView(reloadButton);
 
+        Button urlButton = barButton(activity, "⌗", density);
+        urlButton.setOnClickListener(v -> promptForUrl(activity, webView, title, density));
+        bar.addView(urlButton);
+
         Button closeButton = barButton(activity, "✕", density);
         closeButton.setOnClickListener(v -> {
             webView.stopLoading();
             webView.destroy();
             root.removeView(window);
+            activity.endWebOverlayTextInput();
+            dismissFullscreen(root);
+            persistBounds(activity);
         });
         bar.addView(closeButton);
 
@@ -147,6 +183,14 @@ public final class FloatingWebOverlay {
 
         loadSource(activity, webView, browseMode, target);
 
+        // Focus hand-off: while the page holds focus it also owns the system IME.
+        webView.setOnFocusChangeListener((v, hasFocus) -> {
+            border.setStroke(Math.max(1, dp(density, hasFocus ? 3 : 1)),
+                hasFocus ? BORDER_COLOR_FOCUSED : BORDER_COLOR_IDLE);
+            if (hasFocus) activity.beginWebOverlayTextInput(webView);
+            else if (!activity.isFinishing()) activity.endWebOverlayTextInput();
+        });
+
         // --- Resize handle, bottom-right corner ---
         final View handle = new View(activity);
         handle.setBackgroundColor(0x66888888);
@@ -155,11 +199,11 @@ public final class FloatingWebOverlay {
                 Gravity.BOTTOM | Gravity.END);
         window.addView(handle, handleParams);
 
-        attachDrag(bar, window, windowParams, density, null);
-        attachDrag(handle, window, windowParams, density, true);
+        attachDrag(bar, window, windowParams, density, null, () -> {});
+        attachDrag(handle, window, windowParams, density, true, () -> persistBounds(activity));
     }
 
-    private static WebView makeWebView(Activity activity) {
+    private static WebView makeWebView(TermuxActivity activity) {
         final WebView webView = new WebView(activity);
         final WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -170,28 +214,68 @@ public final class FloatingWebOverlay {
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(true);
         webView.setWebViewClient(new WebViewClient());
-        webView.setWebChromeClient(new WebChromeClient());
-        // A WebView inside a plain ViewGroup never wins focus on tap by itself, so the IME
-        // never shows for text fields. Claim focus on first touch and raise the keyboard.
-        webView.setFocusable(true);
-        webView.setFocusableInTouchMode(true);
-        final android.view.inputmethod.InputMethodManager imm = (android.view.inputmethod.InputMethodManager)
-            activity.getSystemService(Context.INPUT_METHOD_SERVICE);
-        webView.setOnTouchListener((v, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN && !v.hasFocus()) {
-                v.requestFocus();
-                if (imm != null) imm.showSoftInput(v, 0);
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onShowCustomView(View view, CustomViewCallback callback) {
+                // Fullscreen video requested by the page: cover the whole content view.
+                ViewGroup root = (ViewGroup) activity.findViewById(android.R.id.content);
+                dismissFullscreen(root);
+                view.setTag("web_overlay_fullscreen");
+                view.setBackgroundColor(Color.BLACK);
+                root.addView(view, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                mFullscreenCallback = callback;
             }
-            return false;
+
+            @Override
+            public void onHideCustomView() {
+                ViewGroup root = (ViewGroup) activity.findViewById(android.R.id.content);
+                dismissFullscreen(root);
+            }
         });
         return webView;
+    }
+
+    private static WebChromeClient.CustomViewCallback mFullscreenCallback;
+
+    private static void dismissFullscreen(ViewGroup root) {
+        for (int i = root.getChildCount() - 1; i >= 0; i--) {
+            View child = root.getChildAt(i);
+            if ("web_overlay_fullscreen".equals(child.getTag())) {
+                root.removeView(child);
+                if (mFullscreenCallback != null) {
+                    mFullscreenCallback.onCustomViewHidden();
+                    mFullscreenCallback = null;
+                }
+            }
+        }
+    }
+
+    private static void promptForUrl(TermuxActivity activity, WebView webView, TextView title,
+                                     float density) {
+        final EditText input = new EditText(activity);
+        input.setSingleLine(true);
+        input.setText(webView.getUrl() != null ? webView.getUrl() : "https://");
+        new AlertDialog.Builder(activity)
+            .setTitle("Open URL")
+            .setView(input)
+            .setPositiveButton("Open", (d, w) -> {
+                String url = input.getText().toString().trim();
+                if (!url.isEmpty()) {
+                    if (!url.contains("://")) url = "https://" + url;
+                    webView.loadUrl(url);
+                    title.setText(url);
+                }
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
     }
 
     private static void loadSource(Context context, WebView webView, boolean browseMode,
                                    String target) {
         if (browseMode || target.startsWith("http://") || target.startsWith("https://")
             || target.startsWith("content://")) {
-            webView.loadUrl(browseMode ? target : ensureScheme(target));
+            webView.loadUrl(browseMode ? ensureScheme(target) : target);
             return;
         }
         Uri uri = resolve(context, target);
@@ -233,11 +317,12 @@ public final class FloatingWebOverlay {
 
     /**
      * Make $grabber drag $window by rewriting the margin params. When $resize is true the drag
-     * changes the window's size instead of its position, anchored at the top-left.
+     * changes the window's size instead of its position, anchored at the top-left. $onDrop runs
+     * once per completed gesture.
      */
     private static void attachDrag(View grabber, ViewGroup window,
                                    FrameLayout.LayoutParams params, float density,
-                                   Boolean resize) {
+                                   Boolean resize, Runnable onDrop) {
         grabber.setOnTouchListener(new View.OnTouchListener() {
             float startX, startY;
             int startLeft, startTop, startW, startH;
@@ -250,34 +335,53 @@ public final class FloatingWebOverlay {
                         startY = event.getRawY();
                         startLeft = params.leftMargin;
                         startTop = params.topMargin;
-                        startW = window.getWidth();
-                        startH = window.getHeight();
+                        startW = params.width;
+                        startH = params.height;
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        float dx = (event.getRawX() - startX) / density;
-                        float dy = (event.getRawY() - startY) / density;
+                        float dx = pxToDp(density, (int) (event.getRawX() - startX));
+                        float dy = pxToDp(density, (int) (event.getRawY() - startY));
                         if (resize == null) {
                             params.leftMargin = Math.max(0, startLeft + (int) (dx * density));
                             params.topMargin = Math.max(0, startTop + (int) (dy * density));
+                            sLeftDp = Math.max(0, startLeft + (int) dx);
+                            sTopDp = Math.max(0, startTop + (int) dy);
                         } else {
                             params.width = Math.max(dp(density, MIN_WIDTH_DP),
                                 startW + (int) (dx * density));
                             params.height = Math.max(dp(density, MIN_HEIGHT_DP),
                                 startH + (int) (dy * density));
-                            sWidthDp = pxToDp(density, params.width);
-                            sHeightDp = pxToDp(density, params.height);
+                            sWidthDp = Math.max(MIN_WIDTH_DP, startW + (int) dx);
+                            sHeightDp = Math.max(MIN_HEIGHT_DP, startH + (int) dy);
                         }
                         window.setLayoutParams(params);
                         return true;
                     case MotionEvent.ACTION_UP:
-                        sLeftDp = pxToDp(density, params.leftMargin);
-                        sTopDp = pxToDp(density, params.topMargin);
+                        onDrop.run();
                         return true;
                     default:
                         return false;
                 }
             }
         });
+    }
+
+    private static void loadPersistedBounds(TermuxActivity activity) {
+        if (sBoundsLoaded) return;
+        android.content.SharedPreferences prefs =
+            activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        sLeftDp = prefs.getInt(KEY_LEFT, -1);
+        sTopDp = prefs.getInt(KEY_TOP, -1);
+        sWidthDp = prefs.getInt(KEY_WIDTH, -1);
+        sHeightDp = prefs.getInt(KEY_HEIGHT, -1);
+        sBoundsLoaded = true;
+    }
+
+    private static void persistBounds(TermuxActivity activity) {
+        android.content.SharedPreferences.Editor editor =
+            activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+        editor.putInt(KEY_LEFT, sLeftDp).putInt(KEY_TOP, sTopDp)
+            .putInt(KEY_WIDTH, sWidthDp).putInt(KEY_HEIGHT, sHeightDp).apply();
     }
 
     private static Button barButton(Activity activity, String label, float density) {
