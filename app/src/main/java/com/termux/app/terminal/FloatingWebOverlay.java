@@ -242,7 +242,6 @@ public final class FloatingWebOverlay {
         barShape.setCornerRadii(new float[]{corner, corner, corner, corner, 0, 0, 0, 0});
         bar.setBackground(barShape);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        column.addView(bar, new LinearLayout.LayoutParams(
         bar.setOrientation(LinearLayout.HORIZONTAL);
         column.addView(bar, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(density, BAR_HEIGHT_DP)));
