@@ -185,7 +185,6 @@ public final class FloatingWebOverlay {
             Object tag = root.getChildAt(i).getTag();
             if (LOG_TAG.equals(tag)) root.removeViewAt(i);
         }
-        dismissFullscreen(root);
 
         loadPersistedBounds(activity, screenW, screenH);
         // Hard ceiling regardless of what persistence or defaults say: 92% per axis.
@@ -284,6 +283,9 @@ public final class FloatingWebOverlay {
         Button minimizeButton = barButton(activity, "—", density);
         bar.addView(minimizeButton);
 
+        Button fullscreenButton = barButton(activity, "⛶", density);
+        bar.addView(fullscreenButton);
+
         Button closeButton = barButton(activity, "✕", density);
         closeButton.setOnClickListener(v -> close(activity, root, window, webView));
         bar.addView(closeButton);
@@ -334,6 +336,30 @@ public final class FloatingWebOverlay {
             sMinimized = true;
             activity.setWebOverlayKeyInterceptor(null);
             showRestoreCircle(activity, root, window, router, density);
+        });
+
+        // --- Fullscreen: the whole floating window fills the screen, shape restored on exit ---
+        final int[] preFullscreen = {-1, -1, -1, -1}; // left, top, width, height (px)
+        fullscreenButton.setOnClickListener(v -> {
+            if (preFullscreen[0] < 0) {
+                preFullscreen[0] = windowParams.leftMargin;
+                preFullscreen[1] = windowParams.topMargin;
+                preFullscreen[2] = windowParams.width;
+                preFullscreen[3] = windowParams.height;
+                windowParams.leftMargin = 0;
+                windowParams.topMargin = 0;
+                windowParams.width = ViewGroup.LayoutParams.MATCH_PARENT;
+                windowParams.height = ViewGroup.LayoutParams.MATCH_PARENT;
+                window.setLayoutParams(windowParams);
+            } else {
+                windowParams.leftMargin = preFullscreen[0];
+                windowParams.topMargin = preFullscreen[1];
+                windowParams.width = preFullscreen[2];
+                windowParams.height = preFullscreen[3];
+                window.setLayoutParams(windowParams);
+                preFullscreen[0] = -1;
+                persistBounds(activity);
+            }
         });
     }
 
@@ -486,37 +512,19 @@ public final class FloatingWebOverlay {
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
-                ViewGroup root = (ViewGroup) activity.findViewById(android.R.id.content);
-                dismissFullscreen(root);
-                view.setTag("web_overlay_fullscreen");
-                view.setBackgroundColor(Color.BLACK);
-                root.addView(view, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                mFullscreenCallback = callback;
+                // Pages (YouTube etc.) offer a fullscreen surface view; taking it would paint
+                // over the whole launcher. Decline it and the video keeps playing inline in the
+                // window — real fullscreen is the overlay's own ⛶ button, which sizes the whole
+                // floating window to the screen.
+                callback.onCustomViewHidden();
             }
 
             @Override
             public void onHideCustomView() {
-                ViewGroup root = (ViewGroup) activity.findViewById(android.R.id.content);
-                dismissFullscreen(root);
+                // Nothing to tear down: custom views are never attached.
             }
         });
         return webView;
-    }
-
-    private static WebChromeClient.CustomViewCallback mFullscreenCallback;
-
-    private static void dismissFullscreen(ViewGroup root) {
-        for (int i = root.getChildCount() - 1; i >= 0; i--) {
-            View child = root.getChildAt(i);
-            if ("web_overlay_fullscreen".equals(child.getTag())) {
-                root.removeView(child);
-                if (mFullscreenCallback != null) {
-                    mFullscreenCallback.onCustomViewHidden();
-                    mFullscreenCallback = null;
-                }
-            }
-        }
     }
 
     private static void close(TermuxActivity activity, ViewGroup root, FrameLayout window,
@@ -537,7 +545,6 @@ public final class FloatingWebOverlay {
         sRouter = null;
         sCircle = null;
         sMinimized = false;
-        dismissFullscreen(root);
         persistBounds(activity);
         webView.stopLoading();
         webView.destroy();
