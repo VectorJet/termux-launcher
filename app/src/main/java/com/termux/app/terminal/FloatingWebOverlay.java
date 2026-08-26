@@ -106,6 +106,38 @@ public final class FloatingWebOverlay {
     private static boolean sCircleWasVisibleBeforeStop;
     @Nullable private static FrameLayout sCircle;
 
+    /** identityHashCode of the pane window the overlay was opened over; 0 = unbound. */
+    private static int sBoundWindowId;
+
+    /**
+     * The overlay belongs to the terminal window it opened over, like a pane float. Switching to
+     * another window hides it (media keeps playing); switching back reveals it.
+     */
+    public static void onActiveWindowChanged(TermuxActivity activity) {
+        if (sWindow == null || sBoundWindowId == 0
+            || activity.getWindow() == null
+            || sWindow.getRootView() != activity.getWindow().getDecorView()
+            || sWasVisibleBeforeStop) return;
+        com.termux.app.terminal.TerminalPaneController panes = activity.getPaneController();
+        int currentId = panes == null || panes.activeWindow() == null
+            ? 0 : System.identityHashCode(panes.activeWindow());
+        if (currentId == 0) return;
+        if (currentId == sBoundWindowId) {
+            // Back on the binding window: reveal again unless the user minimized it.
+            if (!sMinimized && !sWasVisibleBeforeStop && sWindow.getVisibility() != View.VISIBLE) {
+                sWindow.setVisibility(View.VISIBLE);
+                if (sCircle != null) sCircle.setVisibility(View.GONE);
+                if (sRouter != null) activity.setWebOverlayKeyInterceptor(sRouter);
+            }
+            return;
+        }
+        if (sWindow.getVisibility() == View.VISIBLE) {
+            sWindow.setVisibility(View.GONE);
+            if (sCircle != null) sCircle.setVisibility(View.GONE);
+            activity.setWebOverlayKeyInterceptor(null);
+        }
+    }
+
     public static void onHostStarted(TermuxActivity activity) {
         if (sWindow == null || activity.getWindow() == null
             || sWindow.getRootView() != activity.getWindow().getDecorView()) return;
@@ -156,10 +188,15 @@ public final class FloatingWebOverlay {
         dismissFullscreen(root);
 
         loadPersistedBounds(activity, screenW, screenH);
-        final int width = dp(density, clamp(sWidthDp, MIN_WIDTH_DP, screenW / density,
-            (screenW * (DEFAULT_RIGHT_FRAC - DEFAULT_LEFT_FRAC)) / density));
-        final int height = dp(density, clamp(sHeightDp, MIN_HEIGHT_DP, screenH / density,
-            (screenH * (DEFAULT_BOTTOM_FRAC - DEFAULT_TOP_FRAC)) / density));
+        // Hard ceiling regardless of what persistence or defaults say: 92% per axis.
+        final int width = dp(density, Math.min(
+            clamp(sWidthDp, MIN_WIDTH_DP, screenW / density,
+                (screenW * (DEFAULT_RIGHT_FRAC - DEFAULT_LEFT_FRAC)) / density),
+            pxToDp(density, (int) (screenW * 0.92f))));
+        final int height = dp(density, Math.min(
+            clamp(sHeightDp, MIN_HEIGHT_DP, screenH / density,
+                (screenH * (DEFAULT_BOTTOM_FRAC - DEFAULT_TOP_FRAC)) / density),
+            pxToDp(density, (int) (screenH * 0.92f))));
         final int left = dp(density, clamp(sLeftDp, 0, (screenW - width) / density,
             (screenW * DEFAULT_LEFT_FRAC) / density));
         final int top = dp(density, clamp(sTopDp, 0, (screenH - height) / density,
@@ -179,6 +216,10 @@ public final class FloatingWebOverlay {
         windowParams.leftMargin = left;
         windowParams.topMargin = top;
         root.addView(window, windowParams);
+        sBoundWindowId = currentWindowId(activity);
+        Logger.logInfo(LOG_TAG, "overlay shown " + width + "x" + height + " at "
+            + left + "," + top + " on screen " + screenW + "x" + screenH
+            + " bound to window " + sBoundWindowId);
 
         final LinearLayout column = new LinearLayout(activity);
         column.setOrientation(LinearLayout.VERTICAL);
@@ -189,15 +230,26 @@ public final class FloatingWebOverlay {
         // --- Title bar: drag surface, inline URL entry, navigation ---
         final LinearLayout bar = new LinearLayout(activity);
         final WebView webView = makeWebView(activity);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setBackgroundColor(0xEE1F1F24);
+        int surface = MaterialColors.getColor(activity,
+            com.google.android.material.R.attr.colorSurface,
+            Color.BLACK);
+        int onSurface = MaterialColors.getColor(activity,
+            com.google.android.material.R.attr.colorOnSurface, 0xFFDDDDDD);
+        android.graphics.drawable.GradientDrawable barShape =
+            new android.graphics.drawable.GradientDrawable();
+        barShape.setColor(surface);
+        float corner = dp(density, 8);
+        barShape.setCornerRadii(new float[]{corner, corner, corner, corner, 0, 0, 0, 0});
+        bar.setBackground(barShape);
         bar.setGravity(Gravity.CENTER_VERTICAL);
+        column.addView(bar, new LinearLayout.LayoutParams(
+        bar.setOrientation(LinearLayout.HORIZONTAL);
         column.addView(bar, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(density, BAR_HEIGHT_DP)));
 
         final EditText urlBar = new EditText(activity);
         urlBar.setText(browseMode ? target : shortName(target));
-        urlBar.setTextColor(0xFFDDDDDD);
+        urlBar.setTextColor(onSurface);
         urlBar.setHintTextColor(0xFF888888);
         urlBar.setTextSize(13);
         urlBar.setSingleLine(true);
@@ -406,6 +458,12 @@ public final class FloatingWebOverlay {
 
     @Nullable private static ViewTreeObserver.OnGlobalFocusChangeListener sFocusListener;
 
+    private static int currentWindowId(TermuxActivity activity) {
+        com.termux.app.terminal.TerminalPaneController panes = activity.getPaneController();
+        return panes == null || panes.activeWindow() == null
+            ? 0 : System.identityHashCode(panes.activeWindow());
+    }
+
     private static boolean isDescendant(ViewGroup ancestor, @Nullable View view) {
         while (view != null) {
             if (view == ancestor) return true;
@@ -496,7 +554,9 @@ public final class FloatingWebOverlay {
         sCircle = circle;
         GradientDrawable shape = new GradientDrawable();
         shape.setShape(GradientDrawable.OVAL);
-        shape.setColor(0xEE1F1F24);
+        shape.setColor(MaterialColors.getColor(activity,
+            com.google.android.material.R.attr.colorSurface,
+            Color.BLACK));
         shape.setStroke(Math.max(1, dp(density, 2)), MaterialColors.getColor(activity,
             com.google.android.material.R.attr.colorPrimary,
             ContextCompat.getColor(activity, R.color.termux_primary)));
@@ -650,10 +710,18 @@ public final class FloatingWebOverlay {
                         float dx = pxToDp(density, (int) (event.getRawX() - startX));
                         float dy = pxToDp(density, (int) (event.getRawY() - startY));
                         if (resize == null) {
-                            params.leftMargin = Math.max(0, startLeft + (int) (dx * density));
-                            params.topMargin = Math.max(0, startTop + (int) (dy * density));
-                            sLeftDp = Math.max(0, startLeft + (int) dx);
-                            sTopDp = Math.max(0, startTop + (int) dy);
+                            // Keep the whole window reachable: margins clamp to the content view.
+                            ViewGroup host = (ViewGroup) window.getParent();
+                            int maxLeft = Math.max(0,
+                                (host != null ? host.getWidth() : 0) - params.width);
+                            int maxTop = Math.max(0,
+                                (host != null ? host.getHeight() : 0) - params.height);
+                            params.leftMargin = Math.max(0, Math.min(startLeft
+                                + (int) (dx * density), maxLeft));
+                            params.topMargin = Math.max(0, Math.min(startTop
+                                + (int) (dy * density), maxTop));
+                            sLeftDp = pxToDp(density, params.leftMargin);
+                            sTopDp = pxToDp(density, params.topMargin);
                         } else {
                             params.width = Math.max(dp(density, MIN_WIDTH_DP),
                                 startW + (int) (dx * density));
@@ -704,7 +772,9 @@ public final class FloatingWebOverlay {
     private static Button barButton(Activity activity, String label, float density) {
         Button button = new Button(activity);
         button.setText(label);
-        button.setTextColor(0xFFDDDDDD);
+        int onSurface = MaterialColors.getColor(activity,
+            com.google.android.material.R.attr.colorOnSurface, 0xFFDDDDDD);
+        button.setTextColor(onSurface);
         button.setBackgroundColor(Color.TRANSPARENT);
         button.setPadding(dp(density, 10), 0, dp(density, 10), 0);
         button.setMinimumWidth(0);

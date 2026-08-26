@@ -12339,6 +12339,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         }
 
         @Override public void onActivePaneChanged() {
+            com.termux.app.terminal.FloatingWebOverlay.onActiveWindowChanged(TermuxActivity.this);
             TerminalView v = mPaneController.getActivePaneView();
             if (v != null) {
                 mActivePane = v;
