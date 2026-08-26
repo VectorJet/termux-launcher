@@ -250,7 +250,7 @@ public final class FloatingWebOverlay {
 
         // Keyboard follows focus: a stroke goes to the overlay only while a view inside it holds
         // focus, so tapping the terminal behind hands typing straight back to the shell.
-        final ViewTreeObserver.GlobalFocusChangeListener focusListener = (oldFocus, newFocus) -> {
+        final ViewTreeObserver.OnGlobalFocusChangeListener focusListener = (oldFocus, newFocus) -> {
             if (sWindow == null || activity.isFinishing()) return;
             boolean inside = isDescendant(sWindow, newFocus);
             activity.setWebOverlayKeyInterceptor(inside ? router : null);
@@ -404,7 +404,7 @@ public final class FloatingWebOverlay {
         return browseMode ? original : shortName(original);
     }
 
-    @Nullable private static ViewTreeObserver.GlobalFocusChangeListener sFocusListener;
+    @Nullable private static ViewTreeObserver.OnGlobalFocusChangeListener sFocusListener;
 
     private static boolean isDescendant(ViewGroup ancestor, @Nullable View view) {
         while (view != null) {
