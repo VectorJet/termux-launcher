@@ -1071,6 +1071,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         View arrivalHost = findViewById(android.R.id.content);
         if (arrivalHost != null) arrivalHost.post(this::playWeatherArrivalAnimation);
         Logger.logDebug(LOG_TAG, "onStart");
+        com.termux.app.terminal.FloatingWebOverlay.onHostStarted(this);
     
         if (mIsInvalidState) return;
 
@@ -4920,6 +4921,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     protected void onStop() {
         super.onStop();
         Logger.logDebug(LOG_TAG, "onStop");
+        com.termux.app.terminal.FloatingWebOverlay.onHostStopped(this);
         com.termux.app.terminal.TerminalActionDispatcher.getInstance().detach(terminalHost());
         mTerminalFrameMetricsMonitor.stop();
         stopAzEdgePagingLoop();

@@ -11,6 +11,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -24,6 +25,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import com.google.android.material.color.MaterialColors;
 import com.termux.R;
 import com.termux.app.TermuxActivity;
@@ -79,6 +81,44 @@ public final class FloatingWebOverlay {
     private static int sLeftDp = -1, sTopDp = -1, sWidthDp = -1, sHeightDp = -1;
     private static boolean sBoundsLoaded;
 
+    /** Live overlay state, so the host activity can hide it on stop and restore it on start. */
+    @Nullable private static FrameLayout sWindow;
+    @Nullable private static ViewGroup sRoot;
+    @Nullable private static TerminalKeyEventHandler.KeyValueInterceptor sRouter;
+    private static boolean sMinimized;
+
+    /** The overlay is launcher-owned chrome, not content: gone while the host is stopped. */
+    public static void onHostStopped(TermuxActivity activity) {
+        if (sWindow == null || activity.getWindow() == null
+            || sWindow.getRootView() != activity.getWindow().getDecorView()) return;
+        if (sWindow.getVisibility() == View.VISIBLE) {
+            sWindow.setVisibility(View.GONE);
+            sWasVisibleBeforeStop = true;
+        }
+        if (sCircle != null && sCircle.getVisibility() == View.VISIBLE) {
+            sCircle.setVisibility(View.GONE);
+            sCircleWasVisibleBeforeStop = true;
+        }
+        activity.setWebOverlayKeyInterceptor(null);
+    }
+
+    private static boolean sWasVisibleBeforeStop;
+    private static boolean sCircleWasVisibleBeforeStop;
+    @Nullable private static FrameLayout sCircle;
+
+    public static void onHostStarted(TermuxActivity activity) {
+        if (sWindow == null || activity.getWindow() == null
+            || sWindow.getRootView() != activity.getWindow().getDecorView()) return;
+        if (sWasVisibleBeforeStop) {
+            sWindow.setVisibility(View.VISIBLE);
+            sWasVisibleBeforeStop = false;
+            if (sRouter != null && !sMinimized) activity.setWebOverlayKeyInterceptor(sRouter);
+        } else if (sMinimized && sCircle != null && sCircleWasVisibleBeforeStop) {
+            sCircle.setVisibility(View.VISIBLE);
+            sCircleWasVisibleBeforeStop = false;
+        }
+    }
+
     private FloatingWebOverlay() {
     }
 
@@ -115,7 +155,7 @@ public final class FloatingWebOverlay {
         }
         dismissFullscreen(root);
 
-        loadPersistedBounds(activity);
+        loadPersistedBounds(activity, screenW, screenH);
         final int width = dp(density, clamp(sWidthDp, MIN_WIDTH_DP, screenW / density,
             (screenW * (DEFAULT_RIGHT_FRAC - DEFAULT_LEFT_FRAC)) / density));
         final int height = dp(density, clamp(sHeightDp, MIN_HEIGHT_DP, screenH / density,
@@ -203,7 +243,28 @@ public final class FloatingWebOverlay {
         loadSource(activity, webView, browseMode, target);
 
         final WebKeyRouter router = new WebKeyRouter(activity, window, webView, urlBar);
-        activity.setWebOverlayKeyInterceptor(router);
+        sWindow = window;
+        sRoot = root;
+        sRouter = router;
+        sMinimized = false;
+
+        // Keyboard follows focus: a stroke goes to the overlay only while a view inside it holds
+        // focus, so tapping the terminal behind hands typing straight back to the shell.
+        final ViewTreeObserver.GlobalFocusChangeListener focusListener = (oldFocus, newFocus) -> {
+            if (sWindow == null || activity.isFinishing()) return;
+            boolean inside = isDescendant(sWindow, newFocus);
+            activity.setWebOverlayKeyInterceptor(inside ? router : null);
+            window.setForeground(borderDrawable(activity, density, inside));
+        };
+        activity.getWindow().getDecorView().getViewTreeObserver()
+            .addOnGlobalFocusChangeListener(focusListener);
+        sFocusListener = focusListener;
+        // A tap anywhere in the window claims focus for the page, so typing lands there.
+        column.setOnTouchListener((v, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN && !webView.hasFocus())
+                webView.requestFocus();
+            return false;
+        });
 
         // --- Resize handle, bottom-right corner ---
         final View handle = new View(activity);
@@ -219,6 +280,7 @@ public final class FloatingWebOverlay {
         // --- Minimize to a floating circle; media keeps playing in the hidden WebView ---
         minimizeButton.setOnClickListener(v -> {
             window.setVisibility(View.GONE);
+            sMinimized = true;
             activity.setWebOverlayKeyInterceptor(null);
             showRestoreCircle(activity, root, window, router, density);
         });
@@ -342,6 +404,17 @@ public final class FloatingWebOverlay {
         return browseMode ? original : shortName(original);
     }
 
+    @Nullable private static ViewTreeObserver.GlobalFocusChangeListener sFocusListener;
+
+    private static boolean isDescendant(ViewGroup ancestor, @Nullable View view) {
+        while (view != null) {
+            if (view == ancestor) return true;
+            if (!(view.getParent() instanceof View)) return false;
+            view = (View) view.getParent();
+        }
+        return false;
+    }
+
     private static WebView makeWebView(TermuxActivity activity) {
         final WebView webView = new WebView(activity);
         final WebSettings settings = webView.getSettings();
@@ -395,8 +468,18 @@ public final class FloatingWebOverlay {
             Object tag = root.getChildAt(i).getTag();
             if ("web_overlay_circle".equals(tag) || LOG_TAG.equals(tag)) root.removeViewAt(i);
         }
+        if (sFocusListener != null) {
+            activity.getWindow().getDecorView().getViewTreeObserver()
+                .removeOnGlobalFocusChangeListener(sFocusListener);
+            sFocusListener = null;
+        }
         activity.endWebOverlayTextInput();
         activity.setWebOverlayKeyInterceptor(null);
+        sWindow = null;
+        sRoot = null;
+        sRouter = null;
+        sCircle = null;
+        sMinimized = false;
         dismissFullscreen(root);
         persistBounds(activity);
         webView.stopLoading();
@@ -410,6 +493,7 @@ public final class FloatingWebOverlay {
                                           float density) {
         final FrameLayout circle = new FrameLayout(activity);
         circle.setTag("web_overlay_circle");
+        sCircle = circle;
         GradientDrawable shape = new GradientDrawable();
         shape.setShape(GradientDrawable.OVAL);
         shape.setColor(0xEE1F1F24);
@@ -449,17 +533,21 @@ public final class FloatingWebOverlay {
                         float dx = event.getRawX() - startX, dy = event.getRawY() - startY;
                         if (!dragged && Math.hypot(dx, dy) > slop) dragged = true;
                         if (dragged) {
-                            params.leftMargin = Math.max(0, (int) (event.getRawX()
-                                + v.getLeft() - startX - slop));
-                            params.topMargin = Math.max(0, (int) (event.getRawY()
-                                + v.getTop() - startY - slop));
+                            // Keep the circle fully on screen: margins clamp to the content view.
+                            int size = dp(density, CIRCLE_SIZE_DP);
                             params.gravity = Gravity.TOP | Gravity.START;
+                            params.leftMargin = Math.max(0, Math.min((int) (event.getRawX()
+                                + v.getLeft() - startX - slop), root.getWidth() - size));
+                            params.topMargin = Math.max(0, Math.min((int) (event.getRawY()
+                                + v.getTop() - startY - slop), root.getHeight() - size));
                             v.setLayoutParams(params);
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!dragged) {
                             root.removeView(circle);
+                            sCircle = null;
+                            sMinimized = false;
                             window.setVisibility(View.VISIBLE);
                             activity.setWebOverlayKeyInterceptor(router);
                         }
@@ -586,7 +674,8 @@ public final class FloatingWebOverlay {
         });
     }
 
-    private static void loadPersistedBounds(TermuxActivity activity) {
+    /** Persisted shapes larger than the current screen are stale (rotation, old builds), not user intent. */
+    private static void loadPersistedBounds(TermuxActivity activity, int screenW, int screenH) {
         if (sBoundsLoaded) return;
         android.content.SharedPreferences prefs =
             activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -594,6 +683,13 @@ public final class FloatingWebOverlay {
         sTopDp = prefs.getInt(KEY_TOP, -1);
         sWidthDp = prefs.getInt(KEY_WIDTH, -1);
         sHeightDp = prefs.getInt(KEY_HEIGHT, -1);
+        float density = activity.getResources().getDisplayMetrics().density;
+        int maxW = pxToDp(density, (int) (screenW * 0.95f));
+        int maxH = pxToDp(density, (int) (screenH * 0.95f));
+        if (sWidthDp > maxW || sHeightDp > maxH
+            || sLeftDp > pxToDp(density, screenW) || sTopDp > pxToDp(density, screenH)) {
+            sLeftDp = sTopDp = sWidthDp = sHeightDp = -1;
+        }
         sBoundsLoaded = true;
     }
 
