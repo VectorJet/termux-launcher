@@ -920,15 +920,14 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             TerminalView view = mHost.focusedView();
             if (view != null) view.setTextSize(mHost.preferences().getScratchpadFontSize());
         } else {
-            // Zoom pins a per-pane size on the focused pane instead of moving the app-wide
-            // default, so no other pane — in this window or any other — changes with it. Panes
-            // that were never zoomed keep following the default from settings.
+            // Zoom pins a per-pane size on the focused pane and updates the app-wide
+            // preference, so unzoomed panes and app restarts follow the user's chosen zoom.
             int size = mHost.activePaneFontSize();
             if (size <= 0) size = mHost.preferences().getFontSize();
             size = mHost.preferences().stepFontSize(size, increase);
+            mHost.preferences().setFontSize(size);
             if (!mHost.setActivePaneFontSize(size)) {
                 // No pane controller (compatibility mode): the single view follows the default.
-                mHost.preferences().setFontSize(size);
                 TerminalView view = mHost.focusedView();
                 if (view != null) view.setTextSize(size);
             }

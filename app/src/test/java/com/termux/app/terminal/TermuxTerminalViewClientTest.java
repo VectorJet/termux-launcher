@@ -143,7 +143,20 @@ public class TermuxTerminalViewClientTest {
 
         assertEquals(1.0f, client.onScale(1.4f), 0.0001f);
         assertEquals(expected, host.paneFontSize);
+        assertEquals(expected, host.preferences.getFontSize());
         assertTrue(host.flushDockRequests > 0);
+    }
+
+    @Test
+    public void zoomUpdatesPreferenceForRestarts() throws IOException {
+        FakeTerminalHost host = host();
+        TermuxTerminalViewClient client = client(host);
+        int initial = host.preferences.getFontSize();
+        int expected = host.preferences.stepFontSize(initial, false);
+
+        client.changeFontSize(false);
+        assertEquals(expected, host.paneFontSize);
+        assertEquals(expected, host.preferences.getFontSize());
     }
 
     @Test
