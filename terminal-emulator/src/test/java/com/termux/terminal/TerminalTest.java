@@ -12,7 +12,6 @@ public class TerminalTest extends TerminalTestCase {
 			@Override public void onCopyTextToClipboard(TerminalSession session, String text) {}
 			@Override public void onPasteTextFromClipboard(TerminalSession session) {}
 			@Override public void onBell(TerminalSession session) {}
-			@Override public void onMediaOverlayRequest(TerminalSession session, String source) {}
 			@Override public void onColorsChanged(TerminalSession session) {}
 			@Override public void onTerminalCursorStateChange(boolean state) {}
 			@Override public void setTerminalShellPid(TerminalSession session, int pid) {}
