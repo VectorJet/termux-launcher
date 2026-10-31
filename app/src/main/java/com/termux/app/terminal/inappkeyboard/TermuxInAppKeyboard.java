@@ -1,6 +1,8 @@
 package com.termux.app.terminal.inappkeyboard;
 
 import android.app.Activity;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.res.Configuration;
@@ -10,17 +12,16 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Trace;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.core.content.ContextCompat;
 
 import com.termux.R;
-import com.termux.app.chrome.KeyboardMaterialPolicy;
 import com.termux.app.notice.AppNotice;
 import com.termux.app.place.PlaceLayout;
-import com.termux.shared.theme.ThemeUtils;
+import com.termux.app.terminal.TerminalClipboard;
 import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 import com.termux.shared.termux.settings.preferences.TermuxPreferenceConstants;
 import com.termux.shared.view.KeyboardUtils;
@@ -28,12 +29,14 @@ import com.termux.terminal.TerminalSession;
 import com.termux.view.TerminalView;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.BooleanSupplier;
 
 import juloo.keyboard2.Config;
 import juloo.keyboard2.KeyValue;
@@ -73,7 +76,9 @@ public final class TermuxInAppKeyboard {
         /** A person asked, through {@code keyboard.hide}. */
         TOOL,
         /** Text focus went away, so what a focus signal opened is closed again. */
-        FOCUS
+        FOCUS,
+        /** A hardware keyboard was attached and the setting asks the on-screen one to step aside. */
+        HARDWARE_KEYBOARD
     }
 
     public enum ToggleReason {
@@ -95,6 +100,14 @@ public final class TermuxInAppKeyboard {
     private final ExecutorService mLayoutExecutor;
     private final TapCorrectionController mTapCorrection;
     private TermuxInAppKeyboardLayoutLoader mLayoutLoader;
+    /**
+     * One loader per non-main text layout the keyboard has reached, keyed by id: the file in
+     * {@code ~/.termux/keyboard/layouts/} over the bundled layout it edits, or a user's own.
+     * Created on first use, so a layout never swapped to costs nothing.
+     */
+    private final Map<String, TermuxInAppKeyboardLayoutLoader> mFileLayoutLoaders = new HashMap<>();
+    /** Tests' error sink for layout files; null shows the user-facing notice. */
+    @Nullable private final TermuxInAppKeyboardLayoutLoader.ErrorReporter mLayoutErrorReporter;
 
     private TerminalKeyEventHandler mKeyEventHandler;
     private Keyboard2View mKeyboardView;
@@ -119,11 +132,41 @@ public final class TermuxInAppKeyboard {
     private View.OnFocusChangeListener mSystemImeFocusListener;
     private TerminalKeyEventHandler.KeyValueInterceptor mKeyValueInterceptor;
 
+    /** Whether a hardware keyboard is attached; read fresh each time, injectable for tests. */
+    private BooleanSupplier mHardwareKeyboardConnected;
+    /** The keyboard is down only because the hardware keyboard setting kept an automatic show out. */
+    private boolean mHiddenForHardwareKeyboard;
     private boolean mEnabled;
     private boolean mVisible;
     private boolean mDestroyed;
     private boolean mHeightAdjusting;
     private boolean mExternalTextInputActive;
+    /** Between onStop and onResume: the clipboard is not watched, whatever shows the keys. */
+    private boolean mStopped;
+    /** The clipboard watched while the keys are up, so paste can show a picture is waiting. */
+    @Nullable private ClipboardManager mWatchedClipboard;
+    /** Where the focus listener went; the clipboard can only be read while the window has focus. */
+    @Nullable private ViewTreeObserver mWatchedFocusObserver;
+    /** The last answer of {@link #clipboardHoldsPicture}. */
+    private boolean mClipboardHoldsPicture;
+    /** When the clip was set, wall clock, as last read; 0 for none or an unreadable clipboard. */
+    private long mClipMillis;
+    /** The newest screenshot while the keys are up and may read it; null otherwise. */
+    @Nullable private RecentScreenshot.Shot mScreenshot;
+    /** The screenshot a paste already took, so the key goes back to the clipboard; memory only. */
+    private long mConsumedScreenshotId = PasteOffer.NONE_CONSUMED;
+    /** What the paste key puts in now, handed to every keyboard view made. */
+    @NonNull private PasteOffer mPasteOffer = PasteOffer.CLIPBOARD;
+    private final RecentScreenshot mScreenshots;
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    /** Puts the key back to the clipboard once the offered screenshot stops being fresh. */
+    private final Runnable mPasteOfferExpiry = this::updatePasteOffer;
+    private final ClipboardManager.OnPrimaryClipChangedListener mClipChangedListener =
+        this::readClipboardPicture;
+    private final ViewTreeObserver.OnWindowFocusChangeListener mWindowFocusListener = hasFocus -> {
+        if (hasFocus)
+            readClipboardPicture();
+    };
     /** The place on screen carries its own text fields, so it holds the system IME while down. */
     private boolean mPlaceOwnsSystemIme;
     /** Whether that place keeps the IME even with this keyboard on screen for something else. */
@@ -185,12 +228,18 @@ public final class TermuxInAppKeyboard {
         mHost = Objects.requireNonNull(host, "host");
         mPreferences = Objects.requireNonNull(preferences, "preferences");
         mLayoutExecutor = Objects.requireNonNull(layoutExecutor, "layoutExecutor");
+        mLayoutErrorReporter = errorReporter;
 
         Context context = requireContainer().getContext();
+        mHardwareKeyboardConnected = () -> KeyboardUtils.isHardKeyboardConnected(context);
         mTapCorrection = new TapCorrectionController(
             TapCorrectionController.modelFile(context), mLayoutExecutor,
             new Handler(Looper.getMainLooper()));
         mTapCorrection.setEnabled(mPreferences.isInAppKeyboardTapCorrectionEnabled());
+        mScreenshots = new RecentScreenshot(context, mLayoutExecutor, mMainHandler, shot -> {
+            mScreenshot = shot;
+            updatePasteOffer();
+        });
         mExtraKeysStoredValue = mPreferences.getInAppKeyboardExtraKeys();
         mLayoutOptions = buildLayoutOptions(mExtraKeysStoredValue);
         if (layoutFile == null) {
@@ -210,6 +259,40 @@ public final class TermuxInAppKeyboard {
 
     public boolean isEnabled() {
         return mEnabled;
+    }
+
+    /** Replaces how a connected hardware keyboard is detected; for tests. */
+    void setHardwareKeyboardDetector(@NonNull BooleanSupplier detector) {
+        mHardwareKeyboardConnected = Objects.requireNonNull(detector, "detector");
+    }
+
+    /** Whether the setting asks this keyboard to stay away while a hardware keyboard is attached. */
+    private boolean shouldHideForHardwareKeyboard() {
+        return mPreferences.isSoftKeyboardEnabledOnlyIfNoHardware()
+            && mHardwareKeyboardConnected.getAsBoolean();
+    }
+
+    /** Taps, focus and first enable are the app's doing; the rest are a person asking. */
+    private static boolean isAutomaticShow(@Nullable ShowReason reason) {
+        return reason == ShowReason.FIRST_ENABLE || reason == ShowReason.TERMINAL_TAP
+            || reason == ShowReason.FOCUS;
+    }
+
+    /** Puts down a keyboard that an automatic show raised once the setting and hardware say so. */
+    private void hideForHardwareKeyboardIfNeeded() {
+        if (!mVisible || !shouldHideForHardwareKeyboard() || !isAutomaticShow(mLastShowReason))
+            return;
+        hide(HideReason.HARDWARE_KEYBOARD);
+        if (!mVisible)
+            mHiddenForHardwareKeyboard = true;
+    }
+
+    /** Brings back what the hardware keyboard put down, once it or the setting is gone. */
+    private void restoreAfterHardwareKeyboardIfNeeded() {
+        if (!mHiddenForHardwareKeyboard || shouldHideForHardwareKeyboard())
+            return;
+        mHiddenForHardwareKeyboard = false;
+        show(ShowReason.FIRST_ENABLE);
     }
 
     public boolean isVisible() {
@@ -242,7 +325,14 @@ public final class TermuxInAppKeyboard {
             mVisible = true;
             mLastShowReason = ShowReason.FIRST_ENABLE;
         }
+        if (mEnabled && mVisible && shouldHideForHardwareKeyboard()) {
+            mVisible = false;
+            mHiddenForHardwareKeyboard = true;
+        }
 
+        // Switched off, the keyboard starts down whatever the last instance left it as.
+        if (mPreferences.isKeyboardTurnedOff())
+            mVisible = false;
         if (mEnabled) {
             suppressSystemIme();
             if (mVisible)
@@ -257,17 +347,23 @@ public final class TermuxInAppKeyboard {
     }
 
     public void onResume() {
+        mStopped = false;
         if (!mEnabled || mDestroyed)
             return;
         if (!mExternalTextInputActive)
             suppressSystemIme();
         recheckLayout();
+        hideForHardwareKeyboardIfNeeded();
+        restoreAfterHardwareKeyboardIfNeeded();
         if (mVisible && !mExternalTextInputActive)
             showInternal();
     }
 
     /** Cancels gesture and macro state without changing activity-instance visibility. */
     public void onStop() {
+        mStopped = true;
+        unwatchClipboard();
+        unwatchScreenshots();
         resetInputPipeline();
         mTapCorrection.flush();
     }
@@ -277,6 +373,8 @@ public final class TermuxInAppKeyboard {
             return;
         mDestroyed = true;
         mLastHideReason = HideReason.DESTROYED;
+        unwatchClipboard();
+        unwatchScreenshots();
         resetInputPipeline();
         TerminalView terminalView = mHost == null ? null : mHost.getTerminalView();
         if (terminalView != null && mSystemImeFocusListener != null)
@@ -287,6 +385,9 @@ public final class TermuxInAppKeyboard {
             mHost.detachKeyboardView();
         if (mLayoutLoader != null)
             mLayoutLoader.close();
+        for (TermuxInAppKeyboardLayoutLoader loader : mFileLayoutLoaders.values())
+            loader.close();
+        mFileLayoutLoaders.clear();
         mTapCorrection.flush();
         mLayoutExecutor.shutdown();
         destroyKeyPopup();
@@ -314,6 +415,17 @@ public final class TermuxInAppKeyboard {
         out.putString(STATE_SELECTED_LAYOUT, mSelectedLayoutId);
     }
 
+    /**
+     * What the touch engine files a layout's taps under. Grids are named by key structure, not
+     * pixel size, so portrait and landscape would share one; thumbs land differently in each.
+     */
+    private String tapLayoutKey(String layoutId) {
+        View container = mHost.getKeyboardContainer();
+        boolean landscape = container != null && container.getResources().getConfiguration()
+            .orientation == Configuration.ORIENTATION_LANDSCAPE;
+        return landscape ? layoutId + "|landscape" : layoutId;
+    }
+
     /** Rebuilds immutable density metrics while retaining the parsed layout. */
     public void onConfigurationChanged(Configuration configuration) {
         if (!mEnabled || mDestroyed)
@@ -323,6 +435,7 @@ public final class TermuxInAppKeyboard {
         if (!mHeightAdjusting)
             mHeightScale = mPreferences.getInAppKeyboardHeightScale();
         mFloatingHeightScale = mPreferences.getInAppKeyboardFloatingHeightScale();
+        hideForHardwareKeyboardIfNeeded();
         resetInputPipeline();
         if (mKeyboardView != null) {
             mHost.detachKeyboardView();
@@ -331,10 +444,28 @@ public final class TermuxInAppKeyboard {
         }
         if (mVisible)
             showInternal();
+        restoreAfterHardwareKeyboardIfNeeded();
         // The overlay controls sample colors from the keyboard view, which was just recreated.
         if (mHeightAdjusting)
             mHost.setKeyboardHeightAdjustmentVisible(true);
         mHost.requestAccessoryGeometrySync();
+    }
+
+    /**
+     * The row heights a place layout decides, applied directly: the docked height scale and the
+     * floating multiplier, both kept per orientation. For the launcher's size pass — a turn of
+     * the screen, a grip dragged in the Layout editor — which only moves these; the full
+     * {@link #onPreferencesReloaded} stays for a real preference reload, since it also re-reads
+     * the tap-correction model from disk, the palette, the layout ring and the extra keys.
+     * Applied the way that reload applies them, so a height the grip is still dragging is left to
+     * the grip.
+     */
+    public void setPlaceSizes(float heightScale, float floatingHeightScale) {
+        if (mDestroyed || !mEnabled)
+            return;
+        applyFloatingHeightScale(floatingHeightScale, false);
+        if (!mHeightAdjusting)
+            applyHeightScale(heightScale);
     }
 
     public void onPreferencesReloaded() {
@@ -361,15 +492,25 @@ public final class TermuxInAppKeyboard {
             mKeyCornerRadiusDp = mPreferences.getInAppKeyboardKeyCornerRadiusDp();
             mKeyOpacity = mPreferences.getInAppKeyboardKeyOpacity();
             mEnabled = true;
-            mVisible = true;
+            mVisible = !mPreferences.isKeyboardTurnedOff();
             mLastShowReason = ShowReason.FIRST_ENABLE;
+            mHiddenForHardwareKeyboard = false;
+            if (mVisible && shouldHideForHardwareKeyboard()) {
+                mVisible = false;
+                mHiddenForHardwareKeyboard = true;
+            }
             // The ring may have been edited while the keyboard was off; render the layout it
             // ends on rather than the one this instance was created with.
             reloadLayoutRing(false);
             mSelectedLayoutId = mActiveTextLayoutId;
             suppressSystemIme();
-            showInternal();
+            if (mVisible)
+                showInternal();
+            else
+                setContainerVisible(false);
         } else if (enabled) {
+            hideForHardwareKeyboardIfNeeded();
+            restoreAfterHardwareKeyboardIfNeeded();
             // Settings may have toggled the feature or forgotten the learned taps.
             mTapCorrection.reload();
             mTapCorrection.setEnabled(mPreferences.isInAppKeyboardTapCorrectionEnabled());
@@ -399,16 +540,73 @@ public final class TermuxInAppKeyboard {
     public void show(ShowReason reason) {
         if (!mEnabled || mDestroyed)
             return;
-        boolean wasVisible = mVisible;
-        mLastShowReason = Objects.requireNonNull(reason, "reason");
-        mVisible = true;
-        // Shown, this keyboard is the one typing: the place gives the IME back — unless the place
-        // keeps it while this keyboard is up, in which case the suppression below is a no-op.
-        if (!(mPlaceOwnsSystemIme && mPlaceKeepsSystemImeWhileVisible))
-            mPlaceHoldsSystemIme = false;
-        suppressSystemIme();
-        showInternal();
-        if (!wasVisible && reason != ShowReason.FOCUS) notifyVisibilityChanged(true);
+        // Switched off, nothing raises it — not a tap, not a focus signal, not a key that meant
+        // to. Whoever turns it back on goes through setTurnedOff first. The height editor is the
+        // one exception: it has to show the rows it is resizing.
+        if (mPreferences.isKeyboardTurnedOff() && reason != ShowReason.HEIGHT_ADJUSTMENT)
+            return;
+        if (!gateForHardwareKeyboard(reason))
+            return;
+        Trace.beginSection("Keyboard.show");
+        try {
+            boolean wasVisible = mVisible;
+            mLastShowReason = Objects.requireNonNull(reason, "reason");
+            mVisible = true;
+            // Shown, this keyboard is the one typing: the place gives the IME back — unless the
+            // place keeps it while this keyboard is up, in which case the suppression below is a
+            // no-op.
+            if (!(mPlaceOwnsSystemIme && mPlaceKeepsSystemImeWhileVisible))
+                mPlaceHoldsSystemIme = false;
+            suppressSystemIme();
+            showInternal();
+            if (!wasVisible && reason != ShowReason.FOCUS) notifyVisibilityChanged(true);
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    /**
+     * {@link #show}, for the wall's slide bringing the keyboard up below the screen ahead of the
+     * place that wants it (TermuxActivity#preRollTravelKeyboard). Nothing can be typed on a
+     * keyboard that has not been revealed yet, so the place keeps the system IME until the wall
+     * lands and settles who owns it ({@link #setPlaceOwnsSystemIme}): changing the window's IME
+     * flags relayouts the whole window, which the first frame of a slide cannot afford.
+     */
+    public void showForTravel(ShowReason reason) {
+        if (!mEnabled || mDestroyed)
+            return;
+        if (mPreferences.isKeyboardTurnedOff())
+            return;
+        if (!gateForHardwareKeyboard(reason))
+            return;
+        Trace.beginSection("Keyboard.showForTravel");
+        try {
+            boolean wasVisible = mVisible;
+            mLastShowReason = Objects.requireNonNull(reason, "reason");
+            mVisible = true;
+            showInternal();
+            if (!wasVisible && reason != ShowReason.FOCUS) notifyVisibilityChanged(true);
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    /**
+     * Whether a show may go ahead. With the hardware keyboard setting on and one attached, the
+     * automatic reasons are kept out and remembered; a person asking clears that and goes through.
+     */
+    private boolean gateForHardwareKeyboard(ShowReason reason) {
+        Objects.requireNonNull(reason, "reason");
+        if (!isAutomaticShow(reason)) {
+            mHiddenForHardwareKeyboard = false;
+            return true;
+        }
+        if (shouldHideForHardwareKeyboard()) {
+            if (!mVisible)
+                mHiddenForHardwareKeyboard = true;
+            return false;
+        }
+        return true;
     }
 
     public void hide(HideReason reason) {
@@ -416,15 +614,43 @@ public final class TermuxInAppKeyboard {
             return;
         if (mHeightAdjusting && reason != HideReason.PREFERENCE_DISABLED)
             return;
-        boolean wasVisible = mVisible;
-        mLastHideReason = Objects.requireNonNull(reason, "reason");
-        mVisible = false;
-        resetInputPipeline();
-        setContainerVisible(false);
-        mHost.requestAccessoryGeometrySync();
-        // Down on a place that has its own fields, the IME goes back to the place.
-        syncPlaceSystemIme();
-        if (wasVisible && reason != HideReason.FOCUS) notifyVisibilityChanged(false);
+        Trace.beginSection("Keyboard.hide");
+        try {
+            boolean wasVisible = mVisible;
+            mLastHideReason = Objects.requireNonNull(reason, "reason");
+            mVisible = false;
+            resetInputPipeline();
+            // The panel stands over the keys, so it goes down with them; the next show is the keys.
+            mHost.hideClipboardPanel();
+            setContainerVisible(false);
+            mHost.requestAccessoryGeometrySync();
+            // Down on a place that has its own fields, the IME goes back to the place.
+            syncPlaceSystemIme();
+            if (wasVisible && reason != HideReason.FOCUS) notifyVisibilityChanged(false);
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    /** Whether the user has switched the keyboard off, so nothing but turning it on raises it. */
+    public boolean isTurnedOff() {
+        return mPreferences.isKeyboardTurnedOff();
+    }
+
+    /**
+     * Switches the keyboard off or back on. Off puts it down now and keeps it down; on raises it,
+     * since whoever turned it on is about to type.
+     */
+    public void setTurnedOff(boolean off) {
+        if (mDestroyed)
+            return;
+        mPreferences.setKeyboardTurnedOff(off);
+        if (!mEnabled)
+            return;
+        if (off)
+            hide(HideReason.KEYBOARD_ACTION);
+        else
+            show(ShowReason.KEYBOARD_ACTION);
     }
 
     /** Watch every show and hide that is not a focus signal; pass null to stop. */
@@ -534,8 +760,9 @@ public final class TermuxInAppKeyboard {
     }
 
     /**
-     * Key-cap opacity preview. Deliberately the cheapest editor control: it repaints only the
-     * keyboard view itself — no geometry sync, no accessory glass re-render.
+     * Key-cap opacity preview (Look › Custom's Keys). Deliberately cheap: it repaints only the
+     * keyboard view itself — no geometry sync, no accessory glass re-render — and re-chooses
+     * the legends on the caps as drawn, handing the view a palette only when one moved.
      */
     public void previewSurfaceEditorKeyOpacity(int opacityPercent) {
         if (!mEnabled || mDestroyed)
@@ -646,8 +873,18 @@ public final class TermuxInAppKeyboard {
         if (mKeyOpacity == clamped)
             return;
         mKeyOpacity = clamped;
-        if (mKeyboardView != null)
-            mKeyboardView.setKeyOpacity(mKeyOpacity < 0 ? -1f : mKeyOpacity / 100f);
+        if (mKeyboardView == null || mDestroyed)
+            return;
+        mKeyboardView.setKeyOpacity(mKeyOpacity < 0 ? -1f : mKeyOpacity / 100f);
+        // The legends are chosen on the caps as drawn at this opacity: repaint them only when
+        // that moved a colour the keyboard draws.
+        juloo.keyboard2.Theme.Palette next = createPalette();
+        if (mAppliedPalette != null && sameInks(mAppliedPalette, next))
+            return;
+        mKeyboardView.setPalette(next);
+        mAppliedPalette = next;
+        applyCustomColorScheme();
+        if (mKeyPopup != null) mKeyPopup.refresh();
     }
 
     /** Configured absolute key opacity, or the theme's current effective one when unset. */
@@ -657,6 +894,34 @@ public final class TermuxInAppKeyboard {
         if (mKeyboardView != null)
             return mKeyboardView.getEffectiveKeyFillOpacityPercent();
         return 100;
+    }
+
+    /**
+     * What a letter key's label is drawn in and the cap it stands on, then the same for a function
+     * key (Ctrl, Alt, Fn, the arrows), for the keyboard's legibility band:
+     * {@code {label, cap, functionLabel, functionCap}}, each cap in its key colour at its live
+     * fill alpha (the user's key opacity, or the theme's own; a function chip lets through as much
+     * more glass as the palette gives it). Null while there is no keyboard view. The band measures
+     * them and veils the host where no legend tone the palette can choose reads.
+     */
+    @Nullable
+    public int[] letterKeyLegibilityInks() {
+        if (mDestroyed || mKeyboardView == null)
+            return null;
+        juloo.keyboard2.Theme.Palette palette = createPalette();
+        int alpha = Math.max(0, Math.min(255,
+            Math.round(255f * getEffectiveKeyOpacityPercent() / 100f)));
+        int cap = (alpha << 24) | (palette.keyBackground & 0x00FFFFFF);
+        // A host-set key opacity fills every cap alike; the theme's own scales each role's alpha.
+        int keyAlpha = android.graphics.Color.alpha(palette.keyBackground);
+        int functionAlpha = mKeyOpacity >= 0 || keyAlpha == 0 ? alpha : Math.max(0, Math.min(255,
+            Math.round(alpha * android.graphics.Color.alpha(palette.functionKeyBackground)
+                / (float) keyAlpha)));
+        int functionCap = (functionAlpha << 24) | (palette.functionKeyBackground & 0x00FFFFFF);
+        // The function legends are drawn secondary (Ctrl, Alt, Fn, Shift, the arrows, 123+), the
+        // tone moved toward mid grey, so the veil is bought for that rendition.
+        return new int[] {palette.labelColor | 0xFF000000, cap,
+            InAppKeyboardPaletteFactory.secondaryOf(palette.functionLabelColor), functionCap};
     }
 
     private void applyKeyCornerRadiusDp(float radiusDp) {
@@ -831,6 +1096,14 @@ public final class TermuxInAppKeyboard {
     }
 
     /**
+     * Input reached the terminal from somewhere other than a tap on these keys — a hardware key,
+     * a paste from outside the keyboard — so the touch engine reads no take-back across it.
+     */
+    public void onOtherInput() {
+        mTapCorrection.interrupt();
+    }
+
+    /**
      * Paste where the keyboard's own paste key pastes.
      *
      * <p>The extra-keys row carries the same key for when the keyboard is down, and it used to
@@ -842,6 +1115,7 @@ public final class TermuxInAppKeyboard {
      * @return false when there is no keyboard to route through and the caller should paste itself
      */
     public boolean pasteThroughKeyboard() {
+        onOtherInput();
         KeyValue paste = KeyValue.getKeyByName("paste");
         if (paste == null)
             return false;
@@ -867,6 +1141,35 @@ public final class TermuxInAppKeyboard {
             return handler.offerToInterceptor(value, ctrl, alt, shift);
         TerminalKeyEventHandler.KeyValueInterceptor interceptor = mKeyValueInterceptor;
         return interceptor != null && interceptor.interceptKeyValue(value, ctrl, alt, shift);
+    }
+
+    /**
+     * Whether something other than the terminal — the Display place, an overlay — has claimed
+     * typing. Voice input cleans transcripts for a shell only when nothing has.
+     */
+    public boolean hasKeyValueInterceptor() {
+        return mKeyValueInterceptor != null;
+    }
+
+    /**
+     * Act on a value as though a key of the keyboard had produced it, under Ctrl when asked: the
+     * interceptor gets first refusal, then the terminal. Spoken "enter" and "control c" land where
+     * the keyboard's own keys would. False when the keyboard has never been shown, so there is no
+     * handler to route through.
+     */
+    public boolean dispatchKeyValue(@NonNull KeyValue value, boolean ctrl) {
+        TerminalKeyEventHandler handler = mKeyEventHandler;
+        if (handler == null)
+            return false;
+        handler.dispatchKeyValue(value, ctrl);
+        return true;
+    }
+
+    /** Draws the voice key as pressed while voice input is listening. */
+    public void setVoiceTypingActive(boolean active) {
+        Keyboard2View view = mKeyboardView;
+        if (view != null)
+            view.setVoiceTypingActive(active);
     }
 
     /** On-screen bounds of the rendered space bar, or false when there is none to seed from. */
@@ -985,29 +1288,36 @@ public final class TermuxInAppKeyboard {
             if (terminalView == null || activity == null)
                 return;
 
-            // Hide through the insets API first: it works at the window level, so it still
-            // lands when no view is served — the IMM hide alone fails there, and setting
-            // ALT_FOCUSABLE_IM before a successful hide strands the IME on screen for good.
-            hideSystemImeViaInsets(activity);
-            KeyboardUtils.hideSoftKeyboard(activity, terminalView);
-            KeyboardUtils.setDisableSoftKeyboardFlags(activity);
-            int softInputMode = activity.getWindow().getAttributes().softInputMode;
-            softInputMode = (softInputMode & ~(WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE
-                | WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST))
-                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
-                | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
-            activity.getWindow().setSoftInputMode(softInputMode);
-            if (mSystemImeFocusListener == null) {
-                mSystemImeFocusListener = (view, hasFocus) -> {
-                    if (hasFocus) {
-                        hideSystemImeViaInsets(activity);
-                        KeyboardUtils.hideSoftKeyboard(activity, terminalView);
-                        KeyboardUtils.setDisableSoftKeyboardFlags(activity);
-                    }
-                };
-                terminalView.setOnFocusChangeListener(mSystemImeFocusListener);
+            // Changing the window's IME flags or soft-input mode relayouts the whole window, so
+            // this shows up in a trace as its own section when it lands in a frame.
+            Trace.beginSection("Keyboard.suppressSystemIme");
+            try {
+                // Hide through the insets API first: it works at the window level, so it still
+                // lands when no view is served — the IMM hide alone fails there, and setting
+                // ALT_FOCUSABLE_IM before a successful hide strands the IME on screen for good.
+                hideSystemImeViaInsets(activity);
+                KeyboardUtils.hideSoftKeyboard(activity, terminalView);
+                KeyboardUtils.setDisableSoftKeyboardFlags(activity);
+                int softInputMode = activity.getWindow().getAttributes().softInputMode;
+                softInputMode = (softInputMode & ~(WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE
+                    | WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST))
+                    | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+                    | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
+                activity.getWindow().setSoftInputMode(softInputMode);
+                if (mSystemImeFocusListener == null) {
+                    mSystemImeFocusListener = (view, hasFocus) -> {
+                        if (hasFocus) {
+                            hideSystemImeViaInsets(activity);
+                            KeyboardUtils.hideSoftKeyboard(activity, terminalView);
+                            KeyboardUtils.setDisableSoftKeyboardFlags(activity);
+                        }
+                    };
+                    terminalView.setOnFocusChangeListener(mSystemImeFocusListener);
+                }
+                terminalView.requestFocus();
+            } finally {
+                Trace.endSection();
             }
-            terminalView.requestFocus();
         });
     }
 
@@ -1025,17 +1335,22 @@ public final class TermuxInAppKeyboard {
                 return;
             Activity activity = findActivity(requireContainer().getContext());
             if (activity == null) return;
-            TerminalView terminalView = mHost.getTerminalView();
-            if (terminalView != null && mSystemImeFocusListener != null)
-                terminalView.setOnFocusChangeListener(null);
-            mSystemImeFocusListener = null;
-            KeyboardUtils.clearDisableSoftKeyboardFlags(activity);
-            int mode = activity.getWindow().getAttributes().softInputMode;
-            mode = (mode & ~(WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE
-                | WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST))
-                | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED
-                | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
-            activity.getWindow().setSoftInputMode(mode);
+            Trace.beginSection("Keyboard.releaseSystemIme");
+            try {
+                TerminalView terminalView = mHost.getTerminalView();
+                if (terminalView != null && mSystemImeFocusListener != null)
+                    terminalView.setOnFocusChangeListener(null);
+                mSystemImeFocusListener = null;
+                KeyboardUtils.clearDisableSoftKeyboardFlags(activity);
+                int mode = activity.getWindow().getAttributes().softInputMode;
+                mode = (mode & ~(WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE
+                    | WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST))
+                    | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED
+                    | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
+                activity.getWindow().setSoftInputMode(mode);
+            } finally {
+                Trace.endSection();
+            }
         });
     }
 
@@ -1126,13 +1441,20 @@ public final class TermuxInAppKeyboard {
             setContainerVisible(false);
             return;
         }
-        ensureKeyboardView();
-        // Hiding keeps the renderer alive, so a theme or wallpaper change that arrived while the
-        // keyboard was off screen is applied on the way back on.
-        refreshMaterialPaletteIfSignatureMoved();
-        setContainerVisible(true);
-        mHost.requestAccessoryGeometrySync();
-        recheckLayout();
+        Trace.beginSection("Keyboard.showInternal");
+        try {
+            ensureKeyboardView();
+            // Hiding keeps the renderer alive, so a theme or wallpaper change that arrived while
+            // the keyboard was off screen is applied on the way back on.
+            refreshMaterialPaletteIfSignatureMoved();
+            setContainerVisible(true);
+            watchClipboard();
+            watchScreenshots();
+            mHost.requestAccessoryGeometrySync();
+            recheckLayout();
+        } finally {
+            Trace.endSection();
+        }
     }
 
     private void ensureKeyboardView() {
@@ -1146,12 +1468,16 @@ public final class TermuxInAppKeyboard {
         mKeyEventHandler.setKeyValueInterceptor(mKeyValueInterceptor);
         Config.Builder configBuilder = new Config.Builder(
             requireContainer().getResources(), mKeyEventHandler);
-        configBuilder.hapticEnabled = mPreferences.isInAppKeyboardHapticsEnabled();
+        configBuilder.hapticEnabled = mPreferences.isInAppKeyboardHapticsEnabled()
+            && mPreferences.isAppHapticsEnabled();
         configBuilder.keySoundEnabled = mPreferences.isInAppKeyboardKeySoundEnabled();
         configBuilder.labelFont = loadCustomLabelFont();
+        // Nerd Font icons (the space bar's swipe glyphs, tool keys) stay in the bundled symbols
+        // font whatever face the user picked for labels; a picked font rarely has them.
+        configBuilder.symbolFont = bundledSymbolsLabelFont();
         mAppliedConfigSignature = configPreferenceSignature();
         mKeyboardView = new Keyboard2View(requireContainer().getContext(),
-            configBuilder.build(), createPalette());
+            configBuilder.build(), recordedPalette());
         mAppliedPaletteInputs = paletteInputsSignature();
         mAppliedPaletteSignature = InAppKeyboardPaletteFactory.signature(
             requireContainer().getContext());
@@ -1159,8 +1485,9 @@ public final class TermuxInAppKeyboard {
         mKeyboardView.setKeyMarginScale(mKeyMarginScale);
         mKeyboardView.setKeyCornerRadiusOverride(radiusDpToPx(mKeyCornerRadiusDp));
         mKeyboardView.setKeyOpacity(mKeyOpacity < 0 ? -1f : mKeyOpacity / 100f);
-        mTapCorrection.setLayoutId(mSelectedLayoutId);
+        mTapCorrection.setLayoutId(tapLayoutKey(mSelectedLayoutId));
         mKeyboardView.setTapResolver(mTapCorrection);
+        mKeyboardView.setPasteShowsPicture(mPasteOffer.showsPicture());
         applyKeyboardToView(getSelectedLayoutData());
         applyCustomColorScheme();
         mHost.attachKeyboardView(mKeyboardView);
@@ -1200,17 +1527,89 @@ public final class TermuxInAppKeyboard {
         mGreekMathKeyboardData = null;
         if (mLayoutLoader != null)
             mLayoutLoader.setLayoutOptions(mLayoutOptions);
+        for (TermuxInAppKeyboardLayoutLoader loader : mFileLayoutLoaders.values())
+            loader.setLayoutOptions(mLayoutOptions);
         if (mKeyboardView != null) {
             resetInputPipeline();
             applyKeyboardToView(getSelectedLayoutData());
         }
     }
 
+    /**
+     * The glass faces the keys stand on, one per row top to bottom, as the launcher measured them
+     * ({@link #setGlassFaces}); empty until it has, and the palette checks its legends against the
+     * theme's base.
+     */
+    @NonNull private int[] mGlassFaces = new int[0];
+    /** The legend tone the launcher chose ({@link #setGlassFaces(int[], int)}); any until told. */
+    private int mGlassTone = InAppKeyboardPaletteFactory.TONE_ANY;
+
+    /**
+     * The faces under the keys moved (an opacity, Shade, Tint, hue or Glass change, a new
+     * wallpaper, the veil): the legends are re-chosen so they read on every row's face, and the
+     * live keyboard is repainted only when that changed a colour it draws. Called from the
+     * launcher's dress pass, never per frame of drawing; faces that did not move cost one
+     * comparison.
+     */
+    public void setGlassFaces(@NonNull int[] faces) {
+        setGlassFaces(faces, InAppKeyboardPaletteFactory.TONE_ANY);
+    }
+
+    /**
+     * {@link #setGlassFaces(int[])} with the legend tone the launcher chose on the bare face
+     * ({@code ChromeInk#bandTone}): the letters and function legends are held to it.
+     */
+    public void setGlassFaces(@NonNull int[] faces, int tone) {
+        if (java.util.Arrays.equals(faces, mGlassFaces) && tone == mGlassTone)
+            return;
+        mGlassFaces = faces.clone();
+        mGlassTone = tone;
+        if (mDestroyed || mKeyboardView == null)
+            return;
+        juloo.keyboard2.Theme.Palette next = createPalette();
+        if (mAppliedPalette != null && sameInks(mAppliedPalette, next))
+            return;
+        mKeyboardView.setPalette(next);
+        mAppliedPalette = next;
+        applyCustomColorScheme();
+        if (mKeyPopup != null) mKeyPopup.refresh();
+    }
+
+    /** The last palette handed to the view, for {@link #setGlassFace} to compare against. */
+    @Nullable private juloo.keyboard2.Theme.Palette mAppliedPalette;
+
+    /** Whether two palettes draw the same legends and caps, all that a face can move. */
+    static boolean sameInks(@NonNull juloo.keyboard2.Theme.Palette a,
+                            @NonNull juloo.keyboard2.Theme.Palette b) {
+        return a.labelColor == b.labelColor && a.subLabelColor == b.subLabelColor
+            && a.functionLabelColor == b.functionLabelColor
+            // A function chip whose fill was raised for its legend (see
+            // InAppKeyboardPaletteFactory#createGlass) is a move too.
+            && a.functionKeyBackground == b.functionKeyBackground
+            && a.actionLabelColor == b.actionLabelColor
+            && a.actionSubLabelColor == b.actionSubLabelColor
+            && a.activatedLabelColor == b.activatedLabelColor
+            && a.pressedLabelColor == b.pressedLabelColor
+            && a.lockedModifierColor == b.lockedModifierColor
+            && a.borderColor == b.borderColor
+            && a.keyGradientTopOverlay == b.keyGradientTopOverlay
+            && a.keyGradientBottomOverlay == b.keyGradientBottomOverlay;
+    }
+
+    /** {@link #createPalette()} for the view, remembered as the one it draws. */
+    @NonNull
+    private juloo.keyboard2.Theme.Palette recordedPalette() {
+        mAppliedPalette = createPalette();
+        return mAppliedPalette;
+    }
+
     private juloo.keyboard2.Theme.Palette createPalette() {
         Context context = requireContainer().getContext();
         String theme = mPreferences.getInAppKeyboardTheme();
         juloo.keyboard2.Theme.Palette palette =
-            InAppKeyboardPaletteFactory.createGlass(context, theme);
+            InAppKeyboardPaletteFactory.createGlass(context, theme,
+                com.termux.app.chrome.GlassLook.of(mPreferences), mGlassFaces, mKeyOpacity,
+                mGlassTone);
         InAppKeyboardColorScheme scheme = InAppKeyboardColorScheme.fromJson(context,
             mPreferences.getInAppKeyboardColorScheme());
         return scheme.shouldApplyImportedPalette(theme) ? scheme.applyToPalette(palette) : palette;
@@ -1219,6 +1618,7 @@ public final class TermuxInAppKeyboard {
     /** Immutable-Config inputs; a change forces a renderer rebuild on preference reload. */
     private String configPreferenceSignature() {
         return mPreferences.isInAppKeyboardHapticsEnabled() + "|"
+            + mPreferences.isAppHapticsEnabled() + "|"
             + mPreferences.isInAppKeyboardKeySoundEnabled() + "|"
             + mPreferences.getInAppKeyboardFontPath();
     }
@@ -1280,7 +1680,7 @@ public final class TermuxInAppKeyboard {
             return;
         }
         mAppliedPaletteInputs = paletteInputs;
-        mKeyboardView.setPalette(createPalette());
+        mKeyboardView.setPalette(recordedPalette());
         if (mKeyPopup != null) mKeyPopup.refresh();
         mAppliedPaletteSignature = InAppKeyboardPaletteFactory.signature(
             requireContainer().getContext());
@@ -1294,6 +1694,7 @@ public final class TermuxInAppKeyboard {
     @NonNull
     private String paletteInputsSignature() {
         return mPreferences.getInAppKeyboardTheme() + "|" + mPreferences.getInAppKeyboardColorScheme()
+            + "|" + mPreferences.getSurfaceGlassTint()
             + "|" + InAppKeyboardPaletteFactory.signature(requireContainer().getContext());
     }
 
@@ -1330,7 +1731,7 @@ public final class TermuxInAppKeyboard {
         mAppliedPaletteInputs = paletteInputsSignature();
         // Both of these reload the stored scheme, so dynamic slots re-resolve against the new
         // Material roles while pinned and imported swatches keep their persisted colors.
-        mKeyboardView.setPalette(createPalette());
+        mKeyboardView.setPalette(recordedPalette());
         applyCustomColorScheme();
         if (mKeyPopup != null) mKeyPopup.refresh();
         return true;
@@ -1343,7 +1744,6 @@ public final class TermuxInAppKeyboard {
         InAppKeyboardColorScheme scheme = InAppKeyboardColorScheme.fromJson(context,
             mPreferences.getInAppKeyboardColorScheme());
         mKeyboardView.setKeyColorOverrides(scheme.resolvedOverrides());
-        applySplitSlabColor();
     }
 
     /**
@@ -1382,17 +1782,63 @@ public final class TermuxInAppKeyboard {
             }
             requestIntrinsicSizeGeometrySync();
         });
+        // Every ring layout, and the one on screen, rechecks its file too: an edit made in
+        // Settings or in a terminal lands on the same return as the ring itself.
+        for (String id : mLayoutRing)
+            recheckLayoutFile(id);
+        recheckLayoutFile(mActiveTextLayoutId);
+    }
+
+    /**
+     * Rechecks {@code layoutId}'s file — a stat, and a background parse only when it changed —
+     * creating its loader on first use. The launcher layout and the modal pads have their own.
+     */
+    private void recheckLayoutFile(String layoutId) {
+        if (!mEnabled || mDestroyed || layoutId == null || LAYOUT_MAIN.equals(layoutId)
+            || LAYOUT_NUMERIC.equals(layoutId) || LAYOUT_GREEK_MATH.equals(layoutId))
+            return;
+        TermuxInAppKeyboardLayoutLoader loader = mFileLayoutLoaders.get(layoutId);
+        if (loader == null) {
+            LauncherKeyboardLayouts.Layout layout = LauncherKeyboardLayouts.find(
+                requireContainer().getResources(), layoutId);
+            File file = KeyboardLayoutFiles.overrideFile(KeyboardLayoutFiles.defaultHome(),
+                layoutId);
+            if (layout == null || file == null)
+                return;
+            // A user layout has no bundled original; a broken one falls back as layout.xml does.
+            int fallbackResId = layout.xmlResId != 0 ? layout.xmlResId
+                : juloo.keyboard2.R.xml.termux_launcher_qwerty;
+            loader = new TermuxInAppKeyboardLayoutLoader(requireContainer().getContext(), file,
+                fallbackResId, mLayoutExecutor, mHost::runOnMain, mLayoutOptions,
+                mLayoutErrorReporter);
+            mFileLayoutLoaders.put(layoutId, loader);
+        }
+        loader.recheck(data -> {
+            if (mDestroyed || !mEnabled)
+                return;
+            if (LauncherKeyboardLayouts.isUserLayout(layoutId))
+                LauncherKeyboardLayouts.rememberUserLabel(layoutId, data.name);
+            if (layoutId.equals(mSelectedLayoutId)) {
+                resetInputPipeline();
+                applyKeyboardToView(formed(data));
+                requestIntrinsicSizeGeometrySync();
+            }
+        });
     }
 
     private void selectLayout(String layoutId) {
         if (!mEnabled || mDestroyed)
             return;
         String normalizedId = normalizeLayoutId(layoutId);
+        // A layout reached for the first time — a palette row or a binding outside the ring —
+        // gets its loader now, so an edited file replaces the bundled one a frame later.
+        if (!mFileLayoutLoaders.containsKey(normalizedId))
+            recheckLayoutFile(normalizedId);
         KeyboardData data = getLayoutData(normalizedId);
         if (data == null)
             return;
         mSelectedLayoutId = normalizedId;
-        mTapCorrection.setLayoutId(normalizedId);
+        mTapCorrection.setLayoutId(tapLayoutKey(normalizedId));
         resetInputPipeline();
         applyKeyboardToView(data);
         requestIntrinsicSizeGeometrySync();
@@ -1409,7 +1855,7 @@ public final class TermuxInAppKeyboard {
     }
 
     /**
-     * [data] parted at every row's midpoint while the type is split, and [data] itself otherwise.
+     * [data] parted into two halves while the type is split, and [data] itself otherwise.
      * Memoised on the layout and gap it was built from: the whole host reads the layout through
      * here, so the view and every index-keyed override describe the same keys.
      */
@@ -1431,7 +1877,8 @@ public final class TermuxInAppKeyboard {
     /**
      * The parting [data] asks for, in key-width units; zero for any type but split. Never
      * narrower than {@link #setMinimumSplitGapPx}'s floor once the view has been measured: the
-     * floor is pixels, and the units that buy them depend on how wide the keys are drawn.
+     * floor is pixels, and the units that buy them depend on how wide the keys are drawn. The
+     * floor is the strip between the two key runs, as the view reports it.
      */
     private float splitGapUnits(@Nullable KeyboardData data) {
         if (data == null || mForm != PlaceLayout.KeyboardForm.SPLIT)
@@ -1440,15 +1887,16 @@ public final class TermuxInAppKeyboard {
             mPreferences.getInAppKeyboardSplitGapFraction());
         if (mMinSplitGapPx <= 0 || mKeyboardView == null)
             return units;
-        return Math.max(units, LayoutModifier.commonGapUnitsForPx(data,
+        return Math.max(units, LayoutModifier.gapUnitsForPx(data,
             mKeyboardView.getKeyContentWidthPx(), mMinSplitGapPx));
     }
 
     /**
-     * Asks the split keyboard to part at least [px] wide, so a host can stand something in the
-     * gap; zero gives the user's own parting back. Idempotent, and re-read on every call: the
-     * floor is in pixels, so the same floor asks for different units once the view has been
-     * measured. Returns whether the halves moved, which is a relayout the caller can wait for.
+     * Asks the split keyboard to leave a strip at least [px] wide between its key runs, so a
+     * host can stand something in the gap; zero gives the user's own parting back.
+     * Idempotent, and re-read on every call: the floor is in pixels, so the same floor asks for
+     * different units once the view has been measured. Returns whether the halves moved, which
+     * is a relayout the caller can wait for.
      */
     public boolean setMinimumSplitGapPx(int px) {
         mMinSplitGapPx = Math.max(0, px);
@@ -1471,40 +1919,15 @@ public final class TermuxInAppKeyboard {
 
     /**
      * Hands the view a layout together with the parting it was built with. The two travel
-     * together: the view sizes its keys from the layout, and the gap tells it where to stop
-     * painting and which presses are not its own.
+     * together: the view sizes its keys from the layout, and the gap tells it where the strip
+     * between the key runs is.
      */
     private void applyKeyboardToView(@Nullable KeyboardData data) {
         if (mKeyboardView == null)
             return;
         mKeyboardView.setSplitGapUnits(appliedSplitGapUnits());
-        applySplitSlabColor();
         if (data != null)
             mKeyboardView.setKeyboard(data);
-    }
-
-    /**
-     * The colour the split halves' slabs are painted in: the launcher's overlay surface role,
-     * {@code colorSurfaceContainerHigh}, resolved here because the keyboard module knows no
-     * launcher attributes.
-     *
-     * <p>A parted keyboard lies over the content on every place — the halves are the panel, not
-     * a fill inside one of the host's surfaces — so per the keyboard-overlays spec (D1, D2) they
-     * are opaque in that one role and ignore the Keyboard surface's opacity. Pushed from the two
-     * places the view's appearance is settled: with the layout, and with every palette refresh,
-     * so a theme or wallpaper change repaints the slabs with the keys.
-     */
-    private void applySplitSlabColor() {
-        if (mKeyboardView == null)
-            return;
-        if (!KeyboardMaterialPolicy.paintsOwnSolidSlabs(mForm)) {
-            mKeyboardView.setSplitBackgroundColor(null);
-            return;
-        }
-        Context context = requireContainer().getContext();
-        mKeyboardView.setSplitBackgroundColor(ThemeUtils.getSystemAttrColor(context,
-            com.termux.shared.R.attr.termuxColorSurfacePanelHigh,
-            ContextCompat.getColor(context, R.color.termux_surface_panel_high)));
     }
 
     /** Re-parts, or un-parts, what is on screen after the keyboard type or the gap moved. */
@@ -1673,6 +2096,17 @@ public final class TermuxInAppKeyboard {
                     mMainKeyboardData = loadBundledLayout(juloo.keyboard2.R.xml.termux_launcher_qwerty);
                 return mMainKeyboardData;
             default:
+                TermuxInAppKeyboardLayoutLoader loader = mFileLayoutLoaders.get(layoutId);
+                KeyboardData fromFile = loader == null ? null : loader.getLastKnownGood();
+                // Reached before its background parse landed: read the file now rather than
+                // flash the layout it falls back to.
+                if (fromFile == null && loader != null) {
+                    fromFile = loader.loadFileNow();
+                    if (fromFile != null && LauncherKeyboardLayouts.isUserLayout(layoutId))
+                        LauncherKeyboardLayouts.rememberUserLabel(layoutId, fromFile.name);
+                }
+                if (fromFile != null)
+                    return fromFile;
                 return getBundledTextLayoutData(layoutId);
         }
     }
@@ -1721,6 +2155,7 @@ public final class TermuxInAppKeyboard {
     }
 
     private void resetInputPipeline() {
+        mTapCorrection.interrupt();
         if (mKeyboardView != null)
             mKeyboardView.resetInputState();
         if (mKeyEventHandler != null)
@@ -1728,9 +2163,140 @@ public final class TermuxInAppKeyboard {
     }
 
     private void setContainerVisible(boolean visible) {
+        if (!visible) {
+            unwatchClipboard();
+            unwatchScreenshots();
+        }
         if (mHost != null) {
             mHost.setKeyboardContainerVisible(visible);
         }
+    }
+
+    /**
+     * Watches the clipboard while the keys are up, so the paste glyph says when a paste will
+     * insert a picture. The clipboard is only readable while the window has focus, and coming
+     * back to the launcher resumes it before focus returns, so focus coming back reads it again.
+     */
+    private void watchClipboard() {
+        if (mWatchedClipboard != null || mStopped || mHost == null)
+            return;
+        View container = requireContainer();
+        ClipboardManager clipboard =
+            (ClipboardManager) container.getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard == null)
+            return;
+        clipboard.addPrimaryClipChangedListener(mClipChangedListener);
+        mWatchedClipboard = clipboard;
+        ViewTreeObserver observer = container.getViewTreeObserver();
+        observer.addOnWindowFocusChangeListener(mWindowFocusListener);
+        mWatchedFocusObserver = observer;
+        readClipboardPicture();
+    }
+
+    private void unwatchClipboard() {
+        if (mWatchedClipboard != null) {
+            mWatchedClipboard.removePrimaryClipChangedListener(mClipChangedListener);
+            mWatchedClipboard = null;
+        }
+        if (mWatchedFocusObserver != null) {
+            // An observer taken before the container was attached is merged into the window's on
+            // attach and dies, so the listener is looked for in the container's current one too.
+            if (mWatchedFocusObserver.isAlive())
+                mWatchedFocusObserver.removeOnWindowFocusChangeListener(mWindowFocusListener);
+            View container = mHost == null ? null : mHost.getKeyboardContainer();
+            ViewTreeObserver current = container == null ? null : container.getViewTreeObserver();
+            if (current != null && current != mWatchedFocusObserver && current.isAlive())
+                current.removeOnWindowFocusChangeListener(mWindowFocusListener);
+            mWatchedFocusObserver = null;
+        }
+    }
+
+    private void readClipboardPicture() {
+        ClipboardManager clipboard = mWatchedClipboard;
+        if (clipboard == null)
+            return;
+        ClipDescription description;
+        try {
+            description = clipboard.getPrimaryClipDescription();
+        } catch (RuntimeException e) {
+            // A clipboard service that throws is no reason for the home screen to fall over.
+            description = null;
+        }
+        mClipboardHoldsPicture = clipboardHoldsPicture(description);
+        mClipMillis = description == null ? 0 : description.getTimestamp();
+        updatePasteOffer();
+    }
+
+    /**
+     * Follows the newest screenshot while the keys are up, so paste can offer one taken after the
+     * last copy. Down, the paste key is the clipboard's alone.
+     */
+    private void watchScreenshots() {
+        if (mStopped || mHost == null)
+            return;
+        mScreenshots.start();
+    }
+
+    private void unwatchScreenshots() {
+        mScreenshots.stop();
+        if (mScreenshot != null) {
+            mScreenshot = null;
+            updatePasteOffer();
+        }
+    }
+
+    /** Settles what paste puts in from what is known now, and shows it on the key. */
+    private void updatePasteOffer() {
+        long now = System.currentTimeMillis();
+        mPasteOffer = PasteOffer.decide(mClipMillis, mClipboardHoldsPicture, mScreenshot,
+            mConsumedScreenshotId, now);
+        mMainHandler.removeCallbacks(mPasteOfferExpiry);
+        if (mPasteOffer == PasteOffer.SCREENSHOT && mScreenshot != null)
+            mMainHandler.postDelayed(mPasteOfferExpiry, PasteOffer.millisUntilStale(mScreenshot, now));
+        Keyboard2View view = mKeyboardView;
+        if (view != null)
+            view.setPasteShowsPicture(mPasteOffer.showsPicture());
+    }
+
+    /**
+     * The screenshot the keyboard's paste puts in instead of the clipboard, or null to paste the
+     * clipboard. A screenshot is taken once: the key then goes back to the clipboard until a newer
+     * one is taken. The clipboard is read again first, as a copy made just before this paste (the
+     * clipboard panel's) has not been heard of yet and must win.
+     */
+    @Nullable
+    public RecentScreenshot.Shot takeScreenshotToPaste() {
+        if (!isVisible())
+            return null;
+        readClipboardPicture();
+        RecentScreenshot.Shot shot = mScreenshot;
+        if (mPasteOffer != PasteOffer.SCREENSHOT || shot == null)
+            return null;
+        mConsumedScreenshotId = shot.id;
+        updatePasteOffer();
+        return shot;
+    }
+
+    /** What the paste key puts in now; for tests. */
+    @NonNull
+    PasteOffer getPasteOffer() {
+        return mPasteOffer;
+    }
+
+    /**
+     * Whether the clip [description] describes pastes as a picture, from the description alone:
+     * reading the clip itself shows the system's "pasted" notice. Any concrete picture type counts,
+     * as it does for paste, which takes the picture even when a caption rides along as text. Null,
+     * which is what an unfocused launcher is given, holds nothing.
+     */
+    static boolean clipboardHoldsPicture(@Nullable ClipDescription description) {
+        if (description == null)
+            return false;
+        int count = description.getMimeTypeCount();
+        List<String> types = new ArrayList<>(count);
+        for (int i = 0; i < count; i++)
+            types.add(description.getMimeType(i));
+        return TerminalClipboard.pictureType(types) != null;
     }
 
     private View requireContainer() {

@@ -31,7 +31,8 @@ public final class AboutSupportPreferencesFragment extends MaterialPreferenceFra
         if (context == null) return;
         setPreferencesFromResource(R.xml.about_support_preferences, rootKey);
         SettingsLayoutUtils.applyScreenLayout(this);
-        url("documentation", "https://github.com/PickleHik3/termux-launcher/tree/dev/docs");
+        url("documentation", TermuxConstants.TERMUX_LAUNCHER_DOCS_URL);
+        url("discord", TermuxConstants.TERMUX_LAUNCHER_DISCORD_URL);
         url("report_issue", "https://github.com/PickleHik3/termux-launcher/issues");
         url("source_code", "https://github.com/PickleHik3/termux-launcher");
         configureAbout(context);
@@ -81,6 +82,7 @@ public final class AboutSupportPreferencesFragment extends MaterialPreferenceFra
         click("open_source_licenses", preference -> {
             new Thread(() -> {
                 StringBuilder text = new StringBuilder(readRaw(context, R.raw.third_party_notices));
+                append(text, "Additional third-party license notices", readRaw(context, R.raw.third_party_licenses));
                 append(text, "GNU General Public License v3", readRaw(context, R.raw.license_gpl_3));
                 append(text, "Apache License 2.0", readRaw(context, R.raw.license_apache_2));
                 append(text, "MIT License", readRaw(context, R.raw.license_mit));

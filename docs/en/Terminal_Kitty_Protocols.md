@@ -1,7 +1,21 @@
-# Kitty protocols and terminal compatibility
+# Graphics, protocols and compatibility
 
-Termux Launcher implements modern application-facing terminal protocols directly in the native
-terminal. Programs negotiate them; users normally do not enable a compatibility switch.
+What the terminal offers programs beyond stock Termux: pictures, the kitty keyboard protocol, text
+sizing, colour-scheme reports, the clipboard protocols, and the cursor trail and screen effects.
+Programs negotiate the protocols themselves; there is no compatibility switch to turn on.
+
+## What works without setup
+
+- Underline styles: single, double, curly, dotted and dashed, with their own colour (SGR 58).
+- Shaping for combining marks, Indic conjuncts, Arabic (in logical order), emoji joined with ZWJ,
+  flags and programming ligatures, all within fixed cells.
+- The kitty keyboard protocol and the kitty multiple-cursors protocol (below).
+- Pictures through kitty graphics, Sixel and iTerm inline images (below).
+- Text sizing (OSC 66), colour-scheme reports, OSC 52 and OSC 5522 clipboard access, OSC 99
+  notifications and the OSC 9;4 progress ring.
+
+`timg -pk` (PNG), `chafa -f kitty` (raw RGBA) and yazi image previews work with no configuration.
+Programs that do not negotiate the keyboard protocol keep the normal Termux key encoding.
 
 ## Terminal identity and detection
 
@@ -13,7 +27,7 @@ TERM_PROGRAM_VERSION=<installed version>
 ```
 
 `TERM` remains `xterm-256color` by default. To use a different terminal identity for programs that
-string-match it, set this in `~/.termux/termux.properties` — the app seeds that file with the
+string-match it, set this in `~/.termux/termux.properties`. The app seeds that file with the
 property documented and commented out, so it is already there to uncomment:
 
 ```properties
@@ -115,6 +129,58 @@ the normal Termux key encoder.
 The Kitty multiple-cursors protocol supports point and rectangular cursors, cursor shape, and color.
 This is independent of the launcher's animated input cursor trail.
 
+## Cursor trail
+
+When the cursor jumps, inside a pane or from one pane to another, a short animated trail follows
+it. Ordinary one-cell typing is not animated, and there is no trail while you are scrolled back.
+Over a text-sizing block the trail covers the whole enlarged cursor.
+
+Pick its look in **Settings → Terminal → Terminal display → Cursor trail**, or in **Appearance →
+Look**: choose **Custom**, tap the terminal, then **Cursor trail**:
+
+- **Default**: kitty's own trail, a solid shape that shears toward the cursor and is gone once it
+  lands.
+- **Motion blur**: a soft, wide smear of blurred cursor copies that lags behind and lingers.
+- **Railgun**: a thin, white-hot beam from the old position that vanishes in a blink, throwing a
+  few sparks.
+- **Torpedo**: a pointed body that travels the path nose first into the cursor, leaving a faint
+  wake of rings.
+- **Pixie dust**: glittering dust that drifts off the path and falls.
+- **Comet**: a tapered streak with a glowing head that draws in behind the cursor.
+
+**Toggle cursor trail** in the [command palette](Command_Palette_And_Actions.md) turns it on or
+off. It is also off in Android's power-save mode and when reduced motion is on.
+
+The Default style is a port of kitty's own `cursor_trail.c`: each corner of the shape chases the
+cursor at its own rate, so the leading edge arrives first. kitty's own directives tune it, read
+from `~/.config/kitty/kitty.conf`:
+
+- `cursor_trail <ms>`: a positive value sets the delay before a cursor move becomes a new target.
+  kitty's `0` does not switch the trail off here; use **Toggle cursor trail**.
+- `cursor_trail_decay <fast> <slow>`: the fastest and slowest decay times, in seconds. Motion blur
+  and Torpedo take longer with a longer slow time, Railgun's shot with a longer fast time; Comet
+  and Pixie dust keep their own timing.
+- `cursor_trail_start_threshold <x> [y]`: how many cells a move must cross before a trail shows.
+- `cursor_trail_color <color>|none`: colours every style; `none` (the default) uses the cursor's
+  colour.
+
+`custom_shaders cursor-trail-motion-blur | cursor-trail-railgun | cursor-trail-torpedo | cursor-trail-pixiedust | cursor-trail-default`
+in `kitty.conf` picks a style and overrides the Settings choice; any other shader name is ignored.
+Motion blur, Railgun and Torpedo are this app's own takes on the kitty shaders they are named
+after; Pixie dust follows kitty's particles.
+
+## Terminal effect and edge colours
+
+**Settings → Terminal → Terminal display → Terminal effect** gives the whole home screen a **CRT**,
+**CRT (green)**, **CRT (amber)** or **TFT grid** look; **None** is the default. It is also on the
+terminal's **Custom** row in **Appearance → Look**, and needs Android 13 or newer. The effect
+covers every terminal pane and the status bar, dock, bars and keyboard around them, with the
+scanlines fixed to the screen. Only the panes curve like a tube; the bars stay flat so every key is
+where you touch it.
+
+**Extend edge colors** in the same section ("Match pane padding to nearby terminal colors."), on
+by default, fills a pane's padding with the terminal colours next to it.
+
 ## Kitty graphics Tier 2
 
 The terminal supports:
@@ -202,13 +268,124 @@ What a program can rely on:
 Full-screen programs redraw on resize anyway; the narrow-pane rule matters only for text already in
 the scrollback.
 
-## Current boundaries
+## Notifications (OSC 99), progress (OSC 9;4) and the clipboard (OSC 52)
 
-- File (`t=f`) and temporary-file (`t=t`) transmissions are accepted; a `t=t` file is deleted only when its path carries `tty-graphics-protocol` and sits in a temporary directory. Shared-memory (`t=s`) transmission is not implemented: Android has no `shm_open`.
-- Unsupported or excessive requests return bounded protocol errors rather than consuming unbounded
-  memory.
-- Image geometry follows terminal cells, so changing a pane's size or font metrics may cause the
-  sending application to redraw or resend an image.
+- **OSC 99** posts a notification in the phone's shade: named, replaceable, with an urgency. Its
+  buttons become Android notification actions, and pressing one reports back to the program by
+  number. Tapping the notification returns to the pane.
+- **OSC 9;4;state;pct** sets the progress ring on the window chip.
+- **OSC 52** writes the Android clipboard, and with `?` reads it. A write from a pane needs the
+  launcher on screen; a read also needs **Settings → Terminal → Clipboard → Let programs read the
+  clipboard**.
 
-For the complete protocol-level feature list, see
-[Rendering and application compatibility](Terminal_Modernization.md#rendering-and-application-compatibility).
+Each escape shares one implementation with `launcherctl`, for a process that has no terminal to
+write an escape into, such as a coding agent's tool runner: `launcherctl notify` (and
+`notify --close` to remove one), `launcherctl progress`, and `launcherctl clipboard copy|paste`.
+They attribute to the current pane unless `--pane` says otherwise. `launcherctl clipboard copy`
+writes even while the launcher is off screen. See [LauncherCtl](LauncherCtl.md) and
+[LauncherCtl API](LauncherCtl_API.md#notifications-the-progress-ring-and-the-clipboard).
+
+## Extended clipboard (OSC 5522)
+
+`kitten clipboard` works. The terminal implements kitty's
+[clipboard protocol](https://sw.kovidgoyal.net/kitty/clipboard/) for text and pictures, on the same
+Android clipboard `OSC 52` uses and under the same rules: a write needs the launcher on screen, and
+a read needs it on screen and *Settings → Terminal → Let programs read the clipboard* on. A refused
+read is answered `status=EPERM`. `CSI ? 5522 $ p` answers `CSI ? 5522 ; 2 $ y` (supported, paste
+events off) or `; 1 $ y` (on), so a program can tell the protocol is there before it uses it.
+
+- **Read** (`type=read`): `text/plain` and `text/plain;charset=utf-8` are answered `OK`, `DATA`
+  packets (3 KiB each, under the requested name) and `DONE`. A picture on the clipboard is offered
+  in its own type (`image/png`, `image/jpeg`, …) and also as `image/png`, re-encoded on request;
+  its text types are offered only when the clip has text beside the picture. The payload `.`
+  lists the types on offer (none for an empty clipboard). A picture is read in the background and
+  may carry up to 32 MiB; a larger one is `EFBIG`, one that cannot be read `EIO`. Every requested
+  type is fetched before `OK`, so a failure is a single status, never half an answer.
+- **Write** (`type=write`, `wdata` chunks, a bare `wdata` to end, optional `walias`): text is
+  assembled and put on the clipboard; `image/*` data (sent under a picture type, or aliased to
+  one) puts that picture on the clipboard instead, with the write's text as a second item when it
+  carried any. Either way the answer is `type=write:status=DONE`. Chunks may split base64 groups;
+  bad base64 is `EINVAL`, more than 64 MiB in all `EFBIG`. Other apps paste the picture through a
+  content link the clipboard grants them; the newest five copied pictures are kept in the app's
+  cache. Pictures do not go into the keyboard's clipboard history.
+- **Paste events** (`CSI ? 5522 h`, off with `l`; saved, restored and reset like any private
+  mode): while on, a paste is not typed into the program. Every way of pasting into the pane
+  instead sends `type=read:status=OK`, one `type=read:status=DATA:mime=Lg==` packet listing the
+  types on offer, and `type=read:status=DONE`, each with `pw=` carrying a single-use password.
+  A read that brings the password back together with a `name=` is answered even with the setting
+  off: the user pasted, which is consent. The password
+  works once, for 60 seconds, and a newer paste replaces it; a read without it, or with a wrong
+  one, is an ordinary read. The launcher still has to be on screen. A picture a keyboard inserts
+  is offered the same way, and the program reads that picture rather than the clipboard.
+- **`id`** is echoed on every answer, stripped to the spec's characters.
+- **Other types**: reading a type the clipboard does not hold is `ENOSYS`; a write that carries only
+  types other than text and pictures is `ENOSYS`, and such data next to text or a picture is
+  dropped. `loc=primary` is `ENOSYS` (Android has no primary selection).
+- **Not implemented**: the `pw`/`name` permission cache beyond the paste-event password; the
+  setting is the gate for every other read.
+- A refused read and an unset clipboard both reach the terminal as "nothing", so both answer
+  `EPERM`; an empty but readable clipboard answers `OK`/`DONE` with no data.
+
+## Touch reports (private mode 5523)
+
+A program that draws its own page, such as a browser shown with kitty graphics, can take the
+fingers raw and recognise taps, drags, flings, pinches and long presses itself. This mode is this
+terminal's own; no other terminal has it.
+
+`CSI ? 5523 h` turns it on, `CSI ? 5523 l` off. It is saved, restored and reset (RIS) like any
+private mode and ends with the session. `CSI ? 5523 $ p` answers `CSI ? 5523 ; 1 $ y` (on) or
+`; 2 $ y` (off), never "not recognised", so a program can probe for it.
+
+While it is on, every finger on the pane is written to the program as
+
+```
+CSI < K ; I ; X ; Y ; T t
+```
+
+- **K**: 0 down, 1 move, 2 up, 3 cancel.
+- **I**: the pointer id, from 0. It stays the same from the finger's down to its up or cancel; a
+  second finger gets another.
+- **X, Y**: the pixel of the text area under the finger, from 1 at the top-left, counted exactly
+  as mode 1016 (SGR-Pixels mouse) counts it, and clamped to the text area.
+- **T**: the event's time in milliseconds on a monotonic clock, masked to 31 bits. Only
+  differences mean anything.
+
+Each finger gets one down when it lands, one move per touch event in which its pixel changed (the
+latest position only, no history), and one up when it lifts. When Android takes the gesture away,
+every finger still down gets a cancel. A finger that lands outside the text area (the padding
+around the grid) is not reported at all.
+
+The terminal does nothing else with these fingers: no tap-to-click, no wheel, no fling, no
+scrollback, no selection, no hold, no pinch font zoom, whatever mouse modes (1000, 1002, 1003,
+1006, 1016) are set. A real mouse or trackpad is not a finger: it keeps reporting through the
+mouse modes, and the keyboard is unchanged. A mode set while a finger is already down takes effect
+from the next touch.
+
+## kitty's own tools
+
+`kitten` installs from [tlstore](Tlstore.md). `kitten icat` works: it warns that it cannot create
+shared memory and falls back to sending the picture through the terminal. `kitten clipboard` works
+(OSC 5522, above). `kitten @` remote control does nothing.
+
+## Key inspector
+
+**Key inspector** in the [command palette](Command_Palette_And_Actions.md) shows each key event,
+the binding that claimed it, the active kitty keyboard flags, and the exact bytes written to the
+shell. It has no shortcut of its own, so it can inspect any key.
+
+## Current limitations
+
+- File (`t=f`) and temporary-file (`t=t`) transfers are accepted; a `t=t` file is deleted only when
+  its path contains `tty-graphics-protocol` and sits in a temporary folder. Shared-memory (`t=s`)
+  transfer is not possible: Android has no `shm_open`.
+- Unsupported or oversized requests get a protocol error instead of using unbounded memory.
+- Image geometry follows terminal cells, so changing a pane's size or font may make the program
+  redraw or resend a picture.
+- kitty file transfer (OSC 5113) and kitty remote control are not implemented.
+- There is no bidirectional paragraph layout; complex scripts are shaped in logical order.
+- Drawing uses Android's canvas; there is no GPU glyph atlas or custom gamma.
+- The legacy-computing wedges, inverse shades, pattern fills and the octant block are drawn from
+  the font, not as geometry (see [Terminal fonts](Terminal_Fonts.md#box-drawing-blocks-braille-and-powerline)).
+- Workspace files do not record a window's layout, so a restored window starts under manual
+  control.
+- The launcher has one terminal screen; it does not open several top-level Android windows.

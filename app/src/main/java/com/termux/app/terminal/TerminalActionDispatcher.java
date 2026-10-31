@@ -98,7 +98,53 @@ public final class TerminalActionDispatcher {
     public static final String TOOL_PANE_CLOSE = "pane.close";
     public static final String TOOL_PANE_WRITE = "pane.write";
     public static final String TOOL_PANE_READ = "pane.read";
+    /**
+     * A whole new window (not a split) opened and driven through the local API, the same way
+     * {@link #TOOL_PANE_OPEN} opens a pane; ownership is the same {@link AgentPaneRegistry}. Not
+     * to be confused with {@link #TOOL_WINDOW_NEW}, the window strip's own + (Ctrl+Alt+C): that
+     * one starts a plain shell for the person in front of the screen and needs the Activity
+     * visible; this one runs a given command for a script and works with another app in front.
+     */
+    public static final String TOOL_WINDOW_OPEN = "window.open";
+    /**
+     * Resize a pane the API opened to a share of its split, or to a number of columns or rows
+     * ({@code POST /v1/panes/{id}/resize}). Not {@link #TOOL_PANE_RESIZE}, the resize keys' tool,
+     * which nudges the focused pane's divider by a step in a direction.
+     */
+    public static final String TOOL_PANE_SET_SIZE = "pane.set_size";
+    /** Bring a window of the current session up by id ({@code POST /v1/windows/{id}/focus}). */
+    public static final String TOOL_WINDOW_FOCUS = "window.focus";
+    /**
+     * Close a window the API opened, by id ({@code POST /v1/windows/{id}/close}). Not
+     * {@link #TOOL_WINDOW_CLOSE}, the close key's tool, which closes whichever window is on screen.
+     */
+    public static final String TOOL_WINDOW_CLOSE_BY_ID = "window.close_by_id";
+    /**
+     * One pane of the current session by id, with its window ({@code GET /v1/panes/{id}}): how
+     * {@code launcherctl pane current} tells a program where it runs and how big its pane is.
+     * Read-only like {@link #TOOL_PANE_LIST}, so it reaches every pane, owned or not.
+     */
+    public static final String TOOL_PANE_INFO = "pane.info";
+    /**
+     * What this launcher's pane API can do beyond opening, listing and driving panes, listed by
+     * {@code pane.list} so a caller can tell an older launcher (no list at all) from this one.
+     * {@code wait} and {@code print-id} belong to the local API server ({@code POST
+     * /v1/panes/{id}/wait}, {@code "print":"id"} on an open) and are listed here because this is
+     * the list callers read.
+     */
+    static final String[] PANE_API_FEATURES =
+        {"placement", "resize", "geometry", "windows", "info", "wait", "print-id"};
     public static final String TOOL_AGENT_STATUS = "agent.status";
+    /**
+     * The signals a program sends around the terminal — a shade notification, the progress ring,
+     * the clipboard — offered over the local API for processes that have no terminal to write the
+     * escape into. Each runs the same {@link ShellSignals} method its escape does. They take an
+     * optional {@code pane} to attribute to; without one, the current pane.
+     */
+    public static final String TOOL_SHELL_NOTIFY = "shell.notify";
+    public static final String TOOL_SHELL_PROGRESS = "shell.progress";
+    public static final String TOOL_CLIPBOARD_WRITE = "clipboard.write";
+    public static final String TOOL_CLIPBOARD_READ = "clipboard.read";
     /** Most transcript lines one pane.read returns; enough to see a screen and its recent past. */
     static final int PANE_READ_MAX_LINES = 500;
     static final int PANE_READ_DEFAULT_LINES = 60;
@@ -139,6 +185,9 @@ public final class TerminalActionDispatcher {
     public static final String TOOL_KEYBOARD_SET_FORM = "keyboard.set_form";
     public static final String TOOL_KEYBOARD_SHOW = "keyboard.show";
     public static final String TOOL_KEYBOARD_HIDE = "keyboard.hide";
+    public static final String TOOL_KEYBOARD_CLIPBOARD = "keyboard.clipboard";
+    public static final String TOOL_KEYBOARD_TOGGLE_ENABLED = "keyboard.toggle_enabled";
+    public static final String TOOL_VOICE_DICTATE = "voice.dictate";
     public static final String TOOL_APPEARANCE_SET_WALLPAPER = "appearance.set_wallpaper";
     public static final String TOOL_APPEARANCE_TOGGLE_WALLPAPER = "appearance.toggle_wallpaper";
     public static final String TOOL_TERMINAL_JUMP_PREVIOUS_PROMPT = "terminal.jump_previous_prompt";
@@ -153,8 +202,10 @@ public final class TerminalActionDispatcher {
     public static final String TOOL_APP_OPEN_APPS_BAR = "app.open_apps_bar";
     public static final String TOOL_APP_COMMAND_PALETTE = "app.command_palette";
     public static final String TOOL_APP_LAUNCH = "app.launch";
+    public static final String TOOL_CONTACT_OPEN = "contact.open";
     public static final String TOOL_APP_KEY_INSPECTOR = "app.key_inspector";
     public static final String TOOL_APP_OPEN_DRAWER = "app.open_drawer";
+    public static final String TOOL_APP_OPEN_APP_DRAWER = "app.open_app_drawer";
     public static final String TOOL_APP_CLOSE_DRAWER = "app.close_drawer";
     public static final String TOOL_TERMINAL_ACTION_SHEET = "terminal.action_sheet";
     public static final String TOOL_SESSION_ACTIVATE_BY_INDEX = "session.activate_by_index";
@@ -206,9 +257,23 @@ public final class TerminalActionDispatcher {
     }
 
     /**
+     * Called from {@link TermuxTerminalSessionActivityClient#onSessionFinished}, for every
+     * session, not just ones a caller might have held the keyboard for — cheaper than asking
+     * first. If {@code session} was holding the in-app keyboard down via
+     * {@code keyboard.hide --hold}, nothing will ever call {@code keyboard.show} for it now that
+     * it is gone, so this shows the keyboard itself rather than leaving it stuck down.
+     */
+    public void onSessionFinished(@NonNull TerminalSession session) {
+        if (!KeyboardHoldTracker.getInstance().releaseOnSessionFinished(session.mHandle)) return;
+        TerminalHost host = currentHost();
+        if (host != null) host.showInAppKeyboard(true);
+    }
+
+    /**
      * Terminal actions that do not need the Activity on screen: the pane routes an agent in a
      * shell drives through the local API. Each only touches session/view state — opening,
-     * listing, focusing, reading, writing or closing a pane — and never calls anything that
+     * listing, focusing, resizing, reading, writing or closing a pane, and opening, focusing or
+     * closing a window — and never calls anything that
      * would bring the app to the Android foreground (no {@code startActivity}, no
      * {@code moveTaskToFront}), so running one while the Activity is merely stopped cannot
      * steal focus from whatever the user is actually looking at. Every other handled tool
@@ -223,6 +288,19 @@ public final class TerminalActionDispatcher {
             case TOOL_PANE_CLOSE:
             case TOOL_PANE_WRITE:
             case TOOL_PANE_READ:
+            case TOOL_WINDOW_OPEN:
+            case TOOL_PANE_SET_SIZE:
+            case TOOL_WINDOW_FOCUS:
+            case TOOL_WINDOW_CLOSE_BY_ID:
+            case TOOL_PANE_INFO:
+            // The signals decide for themselves what a stopped launcher may do: a notification
+            // goes to the shade precisely when nobody is looking, a progress report is state on
+            // the shell for the chip to read when the terminal is next seen, and the clipboard
+            // refuses with its own code rather than the generic one.
+            case TOOL_SHELL_NOTIFY:
+            case TOOL_SHELL_PROGRESS:
+            case TOOL_CLIPBOARD_WRITE:
+            case TOOL_CLIPBOARD_READ:
                 return true;
             default:
                 return false;
@@ -265,6 +343,11 @@ public final class TerminalActionDispatcher {
             case TOOL_PANE_CLOSE:
             case TOOL_PANE_WRITE:
             case TOOL_PANE_READ:
+            case TOOL_WINDOW_OPEN:
+            case TOOL_PANE_SET_SIZE:
+            case TOOL_WINDOW_FOCUS:
+            case TOOL_WINDOW_CLOSE_BY_ID:
+            case TOOL_PANE_INFO:
             case TOOL_AGENT_STATUS:
             case TOOL_WINDOW_NEW:
             case TOOL_WINDOW_CLOSE:
@@ -284,6 +367,9 @@ public final class TerminalActionDispatcher {
             case TOOL_KEYBOARD_SET_FORM:
             case TOOL_KEYBOARD_SHOW:
             case TOOL_KEYBOARD_HIDE:
+            case TOOL_KEYBOARD_CLIPBOARD:
+            case TOOL_KEYBOARD_TOGGLE_ENABLED:
+            case TOOL_VOICE_DICTATE:
             case TOOL_TERMINAL_TOGGLE_TOOLBAR:
             case TOOL_TERMINAL_FONT_SIZE_INCREASE:
             case TOOL_TERMINAL_FONT_SIZE_DECREASE:
@@ -313,7 +399,9 @@ public final class TerminalActionDispatcher {
             case TOOL_APP_OPEN_APPS_BAR:
             case TOOL_APP_COMMAND_PALETTE:
             case TOOL_APP_LAUNCH:
+            case TOOL_CONTACT_OPEN:
             case TOOL_APP_KEY_INSPECTOR:
+            case TOOL_APP_OPEN_APP_DRAWER:
             case TOOL_APP_OPEN_DRAWER:
             case TOOL_APP_CLOSE_DRAWER:
             case TOOL_TERMINAL_ACTION_SHEET:
@@ -325,6 +413,10 @@ public final class TerminalActionDispatcher {
             case TOOL_CLIPBOARD_COPY_SELECTED:
             case TOOL_FONTS_PICK:
             case TOOL_FONTS_INSTALL:
+            case TOOL_SHELL_NOTIFY:
+            case TOOL_SHELL_PROGRESS:
+            case TOOL_CLIPBOARD_WRITE:
+            case TOOL_CLIPBOARD_READ:
                 return true;
             default:
                 return false;
@@ -612,15 +704,77 @@ public final class TerminalActionDispatcher {
                     String cwd = arguments.optString("cwd", "").trim();
                     String title = arguments.optString("title", "").trim();
                     boolean focus = arguments.optBoolean("focus", true);
+                    JSONObject[] placementError = new JSONObject[1];
+                    TerminalPaneController.PlacementRequest placement =
+                        placementArgument(host, arguments, placementError);
+                    if (placementError[0] != null) return placementError[0];
                     TerminalSession opened = host.openCommandPane(command,
-                        cwd.isEmpty() ? null : cwd, title.isEmpty() ? null : title, focus);
+                        cwd.isEmpty() ? null : cwd, title.isEmpty() ? null : title, focus, placement);
                     if (opened == null) {
                         return error(409, "pane_open_failed",
                             "No pane could be opened: there is no active terminal session, or the terminal limit is reached");
                     }
                     AgentPaneRegistry.getInstance().register(opened.mHandle,
                         arguments.optString("tag", "").trim(), command);
-                    return ok().put("pane", paneRecord(host, opened));
+                    TerminalPaneController openedIn = host.paneController();
+                    String layout = openedIn == null ? null
+                        : openedIn.layoutPolicyOf(openedIn.windowOf(opened));
+                    return ok().put("pane", paneRecord(host, opened))
+                        .put("layout", layout == null ? JSONObject.NULL : layout);
+                }
+                case TOOL_WINDOW_OPEN: {
+                    if (!host.isSplitPanesEnabled()) return splitsDisabled();
+                    List<String> command = new java.util.ArrayList<>();
+                    Object rawCommand = arguments.opt("command");
+                    if (rawCommand instanceof JSONArray) {
+                        JSONArray array = (JSONArray) rawCommand;
+                        for (int i = 0; i < array.length(); i++) {
+                            if (!(array.get(i) instanceof String)) {
+                                return error(400, "bad_request", "'command' must be an array of strings");
+                            }
+                            command.add(array.getString(i));
+                        }
+                    } else if (rawCommand instanceof String) {
+                        // A command line rather than argv: hand it to sh so quoting and pipes work.
+                        String line = ((String) rawCommand).trim();
+                        if (!line.isEmpty()) {
+                            command.add("sh");
+                            command.add("-c");
+                            command.add(line);
+                        }
+                    } else if (rawCommand != null && rawCommand != JSONObject.NULL) {
+                        return error(400, "bad_request", "'command' must be a string or an array of strings");
+                    }
+                    // Unlike pane.open, a window with nothing to run is not a useful primitive: a
+                    // plain new window already exists as window.new (Ctrl+Alt+C / the strip's +).
+                    if (command.isEmpty()) return error(400, "bad_request", "Missing 'command'");
+                    String title = arguments.optString("title", "").trim();
+                    String cwd = arguments.optString("cwd", "").trim();
+                    boolean focus = arguments.optBoolean("focus", true);
+                    TerminalSession opened = host.openCommandWindow(command, cwd.isEmpty() ? null : cwd,
+                        title.isEmpty() ? null : title, focus);
+                    if (opened == null) {
+                        return error(409, "window_open_failed",
+                            "No window could be opened: there is no active terminal session, the"
+                                + " terminal limit is reached, or the window could never be given a size");
+                    }
+                    AgentPaneRegistry.getInstance().register(opened.mHandle, "", command);
+                    int columns = 0, rows = 0;
+                    if (opened.getEmulator() != null) {
+                        columns = opened.getEmulator().mColumns;
+                        rows = opened.getEmulator().mRows;
+                    }
+                    TerminalPaneController openedIn = host.paneController();
+                    TerminalPaneController.Window openedWindow =
+                        openedIn == null ? null : openedIn.windowOf(opened);
+                    // "id" and "window" (its index) are the original shape; "pane" is the same id
+                    // under the name the pane routes use, "windowId" what the window routes take.
+                    return ok().put("id", opened.mHandle)
+                        .put("pane", opened.mHandle)
+                        .put("window", windowIndexOf(host, opened))
+                        .put("windowId", openedWindow == null ? JSONObject.NULL : openedWindow.id)
+                        .put("columns", columns)
+                        .put("rows", rows);
                 }
                 case TOOL_PANE_LIST: {
                     if (!host.isSplitPanesEnabled()) return splitsDisabled();
@@ -630,14 +784,7 @@ public final class TerminalActionDispatcher {
                     List<TerminalPaneController.Window> sessionWindows = host.currentSessionWindows();
                     int windowIndex = 0;
                     for (TerminalPaneController.Window window : sessionWindows) {
-                        JSONObject record = new JSONObject();
-                        record.put("index", windowIndex);
-                        record.put("id", window.id);
-                        String windowName = controller == null ? null : controller.windowName(window);
-                        record.put("name", windowName == null ? JSONObject.NULL : windowName);
-                        record.put("current", windowIndex == host.currentWindowIndex());
-                        TerminalSession focused = controller == null ? null : controller.windowActiveSession(window);
-                        record.put("focusedPane", focused == null ? JSONObject.NULL : focused.mHandle);
+                        JSONObject record = windowRecord(host, window, windowIndex);
                         JSONArray panes = new JSONArray();
                         if (controller != null) {
                             for (TerminalSession shell : controller.shellsOf(window)) {
@@ -665,7 +812,96 @@ public final class TerminalActionDispatcher {
                     String layout = host.activePaneLayoutPolicy();
                     return ok().put("windows", windows)
                         .put("activePane", active == null ? JSONObject.NULL : active.mHandle)
+                        .put("layout", layout == null ? JSONObject.NULL : layout)
+                        .put("features", new JSONArray(java.util.Arrays.asList(PANE_API_FEATURES)));
+                }
+                case TOOL_PANE_INFO: {
+                    if (!host.isSplitPanesEnabled()) return splitsDisabled();
+                    TerminalSession target = paneArgument(host, arguments);
+                    if (target == null) return paneNotFound(arguments);
+                    TerminalPaneController controller = host.paneController();
+                    TerminalPaneController.Window window =
+                        controller == null ? null : controller.windowOf(target);
+                    int index = window == null ? -1 : host.currentSessionWindows().indexOf(window);
+                    // Like pane.list, which only shows the current session: a pane of another
+                    // session has no window here to report.
+                    if (index < 0) {
+                        return error(404, "pane_not_found", "No pane with id "
+                            + arguments.optString("id", "") + " in the current session");
+                    }
+                    String layout = controller.layoutPolicyOf(window);
+                    return ok().put("pane", paneRecord(host, target))
+                        .put("window", windowRecord(host, window, index))
                         .put("layout", layout == null ? JSONObject.NULL : layout);
+                }
+                case TOOL_PANE_SET_SIZE: {
+                    if (!host.isSplitPanesEnabled()) return splitsDisabled();
+                    TerminalSession target = paneArgument(host, arguments);
+                    if (target == null) return paneNotFound(arguments);
+                    JSONObject refused = requireOwned(target, toolName);
+                    if (refused != null) return refused;
+                    float size = Float.NaN;
+                    int columns = 0, rows = 0;
+                    if (isGiven(arguments, "size")) {
+                        Double parsed = numberArgument(arguments.opt("size"));
+                        if (parsed == null || !PanePlacementPolicy.isValidShare(parsed)) return badSize();
+                        size = parsed.floatValue();
+                    } else if (isGiven(arguments, "columns")) {
+                        columns = cellsArgument(arguments.opt("columns"));
+                        if (columns <= 0) return badCells("columns");
+                    } else if (isGiven(arguments, "rows")) {
+                        rows = cellsArgument(arguments.opt("rows"));
+                        if (rows <= 0) return badCells("rows");
+                    } else {
+                        return error(400, "bad_request", "Missing 'size', 'columns' or 'rows'");
+                    }
+                    TerminalPaneController controller = host.paneController();
+                    if (controller == null) return noSession(toolName);
+                    if (controller.isFloating(target)) return paneNotTiled();
+                    if (!controller.resizePane(target, size, columns, rows)) {
+                        return error(409, "no_split", columns > 0
+                            ? "That pane has no pane beside it to resize against"
+                            : rows > 0 ? "That pane has no pane above or below it to resize against"
+                            : "That pane is alone in its window, so there is nothing to resize against");
+                    }
+                    String layout = controller.layoutPolicyOf(controller.windowOf(target));
+                    return ok().put("pane", paneRecord(host, target))
+                        .put("layout", layout == null ? JSONObject.NULL : layout);
+                }
+                case TOOL_WINDOW_FOCUS: {
+                    if (!host.isSplitPanesEnabled()) return splitsDisabled();
+                    TerminalPaneController controller = host.paneController();
+                    TerminalPaneController.Window window = windowArgument(host, arguments);
+                    List<TerminalPaneController.Window> sessionWindows = host.currentSessionWindows();
+                    int index = window == null ? -1 : sessionWindows.indexOf(window);
+                    if (controller == null || index < 0) return windowNotFound(arguments);
+                    // With the launcher on screen the switch is the window strip's, travel and
+                    // all; stopped, there is nobody to animate for, as with pane.focus.
+                    if (host.isVisible()) {
+                        host.selectWindow(index);
+                    } else {
+                        TerminalSession focused = controller.windowActiveSession(window);
+                        if (focused != null) host.activateSessionInPanes(focused);
+                    }
+                    return ok().put("window", windowRecord(host, window, index));
+                }
+                case TOOL_WINDOW_CLOSE_BY_ID: {
+                    if (!host.isSplitPanesEnabled()) return splitsDisabled();
+                    TerminalPaneController controller = host.paneController();
+                    TerminalPaneController.Window window = windowArgument(host, arguments);
+                    if (controller == null || window == null) return windowNotFound(arguments);
+                    if (!isWindowOwned(controller, window)) {
+                        return error(403, "not_owned",
+                            "'" + toolName + "' only applies to windows opened through window.open");
+                    }
+                    // Each pane goes the way pane.close sends it, and the window goes with its last
+                    // one (onWindowEmptied), so a stopped launcher animates nothing.
+                    List<TerminalSession> shells = controller.shellsOf(window);
+                    for (TerminalSession shell : shells) {
+                        shell.finishIfRunning();
+                        AgentPaneRegistry.getInstance().forget(shell.mHandle);
+                    }
+                    return ok().put("id", window.id).put("closed", true).put("panes", shells.size());
                 }
                 case TOOL_PANE_FOCUS: {
                     if (!host.isSplitPanesEnabled()) return splitsDisabled();
@@ -737,6 +973,87 @@ public final class TerminalActionDispatcher {
                     host.reportAgentStatus(target, agent.isEmpty() ? null : agent, state);
                     return ok().put("id", target.mHandle)
                         .put("state", clear ? "clear" : raw.toLowerCase(java.util.Locale.ROOT));
+                }
+                case TOOL_SHELL_NOTIFY: {
+                    TermuxTerminalSessionActivityClient client = host.sessionClient();
+                    if (client == null) return error(503, "unavailable", "Terminal session client is not ready");
+                    TerminalSession target = signalTarget(host, arguments);
+                    if (target == null) return signalTargetMissing(host, arguments, toolName);
+                    // "close" takes down the message of that id, as OSC 99's p=close does.
+                    String closeId = arguments.optString("close", "").trim();
+                    if (!closeId.isEmpty()) {
+                        client.signals().notifyClose(target, closeId);
+                        return ok().put("pane", target.mHandle).put("id", closeId).put("closed", true);
+                    }
+                    String title = arguments.optString("title", "");
+                    String body = arguments.optString("body", "");
+                    if (title.trim().isEmpty() && body.trim().isEmpty()) {
+                        return error(400, "bad_request", "Missing 'body' (or 'title')");
+                    }
+                    Integer urgency = parseUrgency(arguments.opt("urgency"));
+                    if (urgency == null) {
+                        return error(400, "bad_request", "'urgency' must be low, normal or critical");
+                    }
+                    com.termux.terminal.KittyNotification notification =
+                        com.termux.terminal.KittyNotification.plain(
+                            arguments.optString("id", ""), title, body, urgency);
+                    boolean shown = client.signals().notify(target, notification);
+                    return ok().put("pane", target.mHandle)
+                        .put("id", notification.getId())
+                        .put("shown", shown);
+                }
+                case TOOL_SHELL_PROGRESS: {
+                    TermuxTerminalSessionActivityClient client = host.sessionClient();
+                    if (client == null) return error(503, "unavailable", "Terminal session client is not ready");
+                    TerminalSession target = signalTarget(host, arguments);
+                    if (target == null) return signalTargetMissing(host, arguments, toolName);
+                    int percent = -1;
+                    if (arguments.has("percent")) {
+                        percent = arguments.optInt("percent", Integer.MIN_VALUE);
+                        if (percent < 0 || percent > 100) {
+                            return error(400, "bad_request", "'percent' must be 0-100");
+                        }
+                    }
+                    // A bare percentage is a normal report; "clear" is state 0 by another name.
+                    Object rawState = arguments.opt("state");
+                    Integer state = rawState == null
+                        ? (percent >= 0 ? (Integer) com.termux.terminal.TerminalEmulator.PROGRESS_STATE_NORMAL : null)
+                        : parseProgressState(rawState);
+                    if (state == null) {
+                        return error(400, "bad_request",
+                            "'state' must be one of clear, normal, error, indeterminate, paused (or a percent)");
+                    }
+                    if (!client.signals().progress(target, state, percent)) {
+                        return error(409, "pane_not_ready", "That pane has no terminal to report on yet");
+                    }
+                    com.termux.terminal.TerminalEmulator emulator = target.getEmulator();
+                    return ok().put("pane", target.mHandle)
+                        .put("state", progressStateName(state))
+                        .put("percent", emulator == null ? 0 : emulator.getProgressValue());
+                }
+                case TOOL_CLIPBOARD_WRITE: {
+                    TermuxTerminalSessionActivityClient client = host.sessionClient();
+                    if (client == null) return error(503, "unavailable", "Terminal session client is not ready");
+                    if (!arguments.has("text") || arguments.isNull("text")) {
+                        return error(400, "bad_request", "Missing 'text'");
+                    }
+                    String text = arguments.optString("text", "");
+                    client.signals().clipboardWriteFromApi(text);
+                    return ok().put("length", text.length());
+                }
+                case TOOL_CLIPBOARD_READ: {
+                    TermuxTerminalSessionActivityClient client = host.sessionClient();
+                    if (client == null) return error(503, "unavailable", "Terminal session client is not ready");
+                    String refusal = client.signals().clipboardReadRefusal();
+                    if (ShellSignals.REFUSAL_READ_DISABLED.equals(refusal)) {
+                        return error(403, refusal,
+                            "Reading the clipboard is switched off in Settings > Terminal > Let programs read the clipboard");
+                    }
+                    if (refusal != null) {
+                        return error(409, refusal, "The launcher is not on screen, so the clipboard cannot be read");
+                    }
+                    String text = client.signals().clipboardRead();
+                    return ok().put("text", text == null ? "" : text);
                 }
                 case TOOL_PANE_EQUALIZE:
                     if (!host.isSplitPanesEnabled()) return splitsDisabled();
@@ -953,10 +1270,28 @@ public final class TerminalActionDispatcher {
                         .recordLaunch(app.appRef.stableId());
                     return ok().put("package", app.appRef.packageName).put("label", app.label);
                 }
+                case TOOL_CONTACT_OPEN: {
+                    String lookupKey = arguments.optString("lookup_key", "").trim();
+                    if (lookupKey.isEmpty()) return error(400, "bad_request", "Missing 'lookup_key'");
+                    // The palette's Contacts row opens the same card, by the same identity.
+                    android.net.Uri card = CommandPaletteContacts.cardUri(
+                        arguments.optLong("contact_id", -1), lookupKey);
+                    try {
+                        host.context().startActivity(
+                            new android.content.Intent(android.content.Intent.ACTION_VIEW, card));
+                    } catch (android.content.ActivityNotFoundException e) {
+                        return error(404, "not_found",
+                            host.context().getString(com.termux.R.string.palette_contact_open_failed));
+                    }
+                    return ok();
+                }
                 case TOOL_APP_KEY_INSPECTOR:
                     return ok().put("keyInspectorOpen", host.toggleKeyInspector());
                 // The drawer these two bindings name is the sessions drawer: one panel out of the
                 // terminal's leading edge, which is what the pair always meant.
+                case TOOL_APP_OPEN_APP_DRAWER:
+                    host.openAppDrawer();
+                    return ok();
                 case TOOL_APP_OPEN_DRAWER:
                     host.showSessionBrowser();
                     return ok();
@@ -997,7 +1332,8 @@ public final class TerminalActionDispatcher {
                         if (shareClient == null) return error(503, "unavailable", "Terminal view client is not ready");
                         shareClient.shareSelectedText();
                     } else {
-                        com.termux.shared.interact.ShareUtils.copyTextToClipboard(host.context(), selected);
+                        // A copy made inside the launcher: the clipboard and the keyboard's history.
+                        ClipboardHistory.copy(host.context(), selected);
                     }
                     return ok().put("characters", selected.length());
                 }
@@ -1145,6 +1481,22 @@ public final class TerminalActionDispatcher {
                         return error(503, "unavailable", "The place on screen is not settled yet");
                     return ok().put("form", form.storageValue());
                 }
+                case TOOL_KEYBOARD_CLIPBOARD: {
+                    if (!host.isInAppKeyboardEnabled())
+                        return error(409, "unavailable", "The in-app keyboard is not enabled");
+                    // Flip; a false answer with the keyboard down means there was nothing to
+                    // stand the panel over, which the caller can fix with keyboard.show first.
+                    boolean shown = host.toggleKeyboardClipboard();
+                    return ok().put("shown", shown);
+                }
+                case TOOL_KEYBOARD_TOGGLE_ENABLED: {
+                    TermuxTerminalViewClient viewClient = host.viewClient();
+                    if (viewClient == null) return error(503, "unavailable", "Terminal view client is not ready");
+                    return ok().put("enabled", viewClient.toggleKeyboardTurnedOff());
+                }
+                case TOOL_VOICE_DICTATE:
+                    // Start or stop; the text waits in the dictation panel, never typed on its own.
+                    return ok().put("listening", host.toggleVoiceDictation());
                 case TOOL_KEYBOARD_SHOW:
                 case TOOL_KEYBOARD_HIDE: {
                     // Deliberately not background-safe: both put a keyboard on screen or take one
@@ -1155,6 +1507,12 @@ public final class TerminalActionDispatcher {
                         return error(400, "bad_request", "'source' must be manual or focus");
                     boolean fromFocus = "focus".equals(source);
                     boolean show = TOOL_KEYBOARD_SHOW.equals(toolName);
+                    // "hold" is a program's own request (tlstore-ui today) to keep the keyboard
+                    // down for as long as it is on screen, rather than for just this one call the
+                    // way source=focus/manual already is. keyboard.show always releases a hold,
+                    // whoever calls it; a hold outlives its session through onSessionFinished
+                    // below, in case the program never calls show back.
+                    boolean hold = !show && arguments.optBoolean("hold", false);
                     // The Display place can be typed into with the phone's own keyboard, which is
                     // there to answer whether or not the in-app keyboard is switched on.
                     if (!host.isInAppKeyboardEnabled() && !host.displayTakesSystemKeyboard())
@@ -1163,7 +1521,13 @@ public final class TerminalActionDispatcher {
                         ? host.showInAppKeyboard(fromFocus) : host.hideInAppKeyboard(fromFocus);
                     if (!applied)
                         return error(409, "unavailable", "The in-app keyboard is not on screen");
-                    return ok().put("source", source).put("keyboardShown", show);
+                    if (show) {
+                        KeyboardHoldTracker.getInstance().release();
+                    } else if (hold) {
+                        TerminalSession session = host.currentSession();
+                        if (session != null) KeyboardHoldTracker.getInstance().hold(session.mHandle);
+                    }
+                    return ok().put("source", source).put("keyboardShown", show).put("held", hold);
                 }
 
                 case TOOL_TERMINAL_TOGGLE_SOFT_KEYBOARD:
@@ -1401,6 +1765,76 @@ public final class TerminalActionDispatcher {
         return id.isEmpty() ? null : host.findPaneById(id);
     }
 
+    /**
+     * The shell a signal is attributed to: the pane named by {@code pane}, or the current pane
+     * when none is named — the case for a process with no terminal, which has no
+     * {@code TERMUX_LAUNCHER_PANE} to pass along. Null when the named pane does not exist, or
+     * nothing is named and there is no current session.
+     */
+    @Nullable
+    private static TerminalSession signalTarget(@NonNull TerminalHost host, @NonNull JSONObject arguments) {
+        String id = arguments.optString("pane", "").trim();
+        return id.isEmpty() ? host.currentSession() : host.findPaneById(id);
+    }
+
+    @NonNull
+    private static JSONObject signalTargetMissing(@NonNull TerminalHost host, @NonNull JSONObject arguments,
+                                                  @NonNull String toolName) {
+        String id = arguments.optString("pane", "").trim();
+        if (id.isEmpty()) return noSession(toolName);
+        return error(404, "pane_not_found", "No pane with id " + id);
+    }
+
+    /**
+     * {@code low}, {@code normal}, {@code critical} or the protocol's 0-2; absent is unset. Null
+     * for anything else.
+     */
+    @Nullable
+    static Integer parseUrgency(@Nullable Object raw) {
+        if (raw == null || JSONObject.NULL.equals(raw)) return com.termux.terminal.KittyNotification.URGENCY_UNSET;
+        if (raw instanceof Number) {
+            int value = ((Number) raw).intValue();
+            return value >= com.termux.terminal.KittyNotification.URGENCY_LOW
+                && value <= com.termux.terminal.KittyNotification.URGENCY_CRITICAL ? value : null;
+        }
+        switch (String.valueOf(raw).trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "": return com.termux.terminal.KittyNotification.URGENCY_UNSET;
+            case "low": case "0": return com.termux.terminal.KittyNotification.URGENCY_LOW;
+            case "normal": case "1": return com.termux.terminal.KittyNotification.URGENCY_NORMAL;
+            case "critical": case "2": return com.termux.terminal.KittyNotification.URGENCY_CRITICAL;
+            default: return null;
+        }
+    }
+
+    /** The OSC 9;4 state a name or number stands for, or null for one this terminal has no ring for. */
+    @Nullable
+    static Integer parseProgressState(@NonNull Object raw) {
+        if (raw instanceof Number) {
+            int value = ((Number) raw).intValue();
+            return progressStateName(value) == null ? null : value;
+        }
+        switch (String.valueOf(raw).trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "clear": case "none": case "0": return com.termux.terminal.TerminalEmulator.PROGRESS_STATE_NONE;
+            case "normal": case "1": return com.termux.terminal.TerminalEmulator.PROGRESS_STATE_NORMAL;
+            case "error": case "2": return com.termux.terminal.TerminalEmulator.PROGRESS_STATE_ERROR;
+            case "indeterminate": case "3": return com.termux.terminal.TerminalEmulator.PROGRESS_STATE_INDETERMINATE;
+            case "paused": case "4": return com.termux.terminal.TerminalEmulator.PROGRESS_STATE_PAUSED;
+            default: return null;
+        }
+    }
+
+    @Nullable
+    static String progressStateName(int state) {
+        switch (state) {
+            case com.termux.terminal.TerminalEmulator.PROGRESS_STATE_NONE: return "clear";
+            case com.termux.terminal.TerminalEmulator.PROGRESS_STATE_NORMAL: return "normal";
+            case com.termux.terminal.TerminalEmulator.PROGRESS_STATE_ERROR: return "error";
+            case com.termux.terminal.TerminalEmulator.PROGRESS_STATE_INDETERMINATE: return "indeterminate";
+            case com.termux.terminal.TerminalEmulator.PROGRESS_STATE_PAUSED: return "paused";
+            default: return null;
+        }
+    }
+
     @NonNull
     private static JSONObject paneNotFound(@NonNull JSONObject arguments) {
         if (!arguments.has("id") || arguments.optString("id", "").trim().isEmpty()) {
@@ -1438,6 +1872,14 @@ public final class TerminalActionDispatcher {
             record.put("rows", session.getEmulator().mRows);
         }
         record.put("focused", host.currentSession() == session);
+        TerminalPaneController controller = host.paneController();
+        TerminalPaneController.Window window = controller == null ? null : controller.windowOf(session);
+        record.put("window", window == null ? JSONObject.NULL : window.id);
+        record.put("floating", controller != null && controller.isFloating(session));
+        int[] geometry = controller == null ? null : controller.paneCellGeometry(session);
+        record.put("geometry", geometry == null ? JSONObject.NULL : new JSONObject()
+            .put("left", geometry[0]).put("top", geometry[1])
+            .put("columns", geometry[2]).put("rows", geometry[3]));
         AgentPaneRegistry.Record owned = AgentPaneRegistry.getInstance().get(session.mHandle);
         if (owned == null) {
             record.put("agent", JSONObject.NULL);
@@ -1449,6 +1891,201 @@ public final class TerminalActionDispatcher {
             record.put("agent", agent);
         }
         return record;
+    }
+
+    /**
+     * Where {@code pane.open} was asked to put its pane, or null when nothing was said about it
+     * and the pane goes where it always has. {@code from} names the pane to split (default: the
+     * pane a split would take now, the focused one); {@code direction}, {@code size},
+     * {@code columns} and {@code rows} say where and how big. A refusal is left in
+     * {@code error[0]}: 400 for a malformed field, 404 for a {@code from} that is not a pane of
+     * the current session, 409 for one that floats.
+     */
+    @Nullable
+    private static TerminalPaneController.PlacementRequest placementArgument(
+            @NonNull TerminalHost host, @NonNull JSONObject arguments, @NonNull JSONObject[] error) {
+        String fromId = arguments.optString("from", "").trim();
+        boolean placed = !fromId.isEmpty() || isGiven(arguments, "direction")
+            || isGiven(arguments, "size") || isGiven(arguments, "columns") || isGiven(arguments, "rows");
+        if (!placed) return null;
+        int side = PanePlacementPolicy.sideFor(arguments.optString("direction", ""));
+        if (side == PanePlacementPolicy.SIDE_INVALID) {
+            error[0] = badDirection();
+            return null;
+        }
+        float size = Float.NaN;
+        if (isGiven(arguments, "size")) {
+            Double parsed = numberArgument(arguments.opt("size"));
+            if (parsed == null || !PanePlacementPolicy.isValidShare(parsed)) {
+                error[0] = badSize();
+                return null;
+            }
+            size = parsed.floatValue();
+        }
+        int columns = 0, rows = 0;
+        if (isGiven(arguments, "columns")) {
+            columns = cellsArgument(arguments.opt("columns"));
+            if (columns <= 0) {
+                error[0] = badCells("columns");
+                return null;
+            }
+        }
+        if (isGiven(arguments, "rows")) {
+            rows = cellsArgument(arguments.opt("rows"));
+            if (rows <= 0) {
+                error[0] = badCells("rows");
+                return null;
+            }
+        }
+        TerminalPaneController controller = host.paneController();
+        TerminalSession from;
+        if (fromId.isEmpty()) {
+            from = controller == null ? null : controller.splitAnchorSession();
+            if (from == null) {
+                error[0] = error(409, "pane_open_failed", "There is no pane on screen to split");
+                return null;
+            }
+        } else {
+            from = host.findPaneById(fromId);
+            TerminalPaneController.Window window =
+                from == null || controller == null ? null : controller.windowOf(from);
+            if (window == null || !host.currentSessionWindows().contains(window)) {
+                error[0] = error(404, "pane_not_found", "No pane with id " + fromId + " in the current session");
+                return null;
+            }
+            if (controller.isFloating(from)) {
+                error[0] = paneNotTiled();
+                return null;
+            }
+        }
+        return new TerminalPaneController.PlacementRequest(from, side, size, columns, rows);
+    }
+
+    /** Whether {@code key} is present with a value; an explicit JSON null counts as absent. */
+    private static boolean isGiven(@NonNull JSONObject arguments, @NonNull String key) {
+        Object value = arguments.opt(key);
+        if (value == null || value == JSONObject.NULL) return false;
+        return !(value instanceof String) || !((String) value).trim().isEmpty();
+    }
+
+    /** A JSON number, or a string holding one (as a query parameter arrives); null otherwise. */
+    @Nullable
+    static Double numberArgument(@Nullable Object raw) {
+        if (raw instanceof Number) {
+            double value = ((Number) raw).doubleValue();
+            return Double.isNaN(value) || Double.isInfinite(value) ? null : value;
+        }
+        if (raw instanceof String) {
+            try {
+                double value = Double.parseDouble(((String) raw).trim());
+                return Double.isNaN(value) || Double.isInfinite(value) ? null : value;
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /** A whole, positive cell count from a number or numeric string; 0 for anything else. */
+    static int cellsArgument(@Nullable Object raw) {
+        Double value = numberArgument(raw);
+        if (value == null || value < 1 || value > 10_000 || value != Math.floor(value)) return 0;
+        return value.intValue();
+    }
+
+    @NonNull
+    private static JSONObject badSize() {
+        return error(400, "bad_request", "'size' must be a number from "
+            + PanePlacementPolicy.MIN_SHARE + " to " + PanePlacementPolicy.MAX_SHARE);
+    }
+
+    @NonNull
+    private static JSONObject badCells(@NonNull String key) {
+        return error(400, "bad_request", "'" + key + "' must be a whole number of cells, at least 1");
+    }
+
+    @NonNull
+    private static JSONObject paneNotTiled() {
+        return error(409, "pane_not_tiled", "That pane floats; only a tiled pane can be split or resized");
+    }
+
+    /**
+     * The window {@code id} names: a window id from {@code pane.list} (a number, looked up in the
+     * current session), or the id of any pane in it — so the {@code id} {@code window.open}
+     * answered with works too. Null when it names neither.
+     */
+    @Nullable
+    private static TerminalPaneController.Window windowArgument(@NonNull TerminalHost host,
+                                                                @NonNull JSONObject arguments) {
+        String id = arguments.optString("id", "").trim();
+        if (id.isEmpty()) return null;
+        try {
+            long windowId = Long.parseLong(id);
+            for (TerminalPaneController.Window window : host.currentSessionWindows()) {
+                if (window.id == windowId) return window;
+            }
+            return null;
+        } catch (NumberFormatException notAWindowId) {
+            TerminalPaneController controller = host.paneController();
+            TerminalSession pane = host.findPaneById(id);
+            return controller == null || pane == null ? null : controller.windowOf(pane);
+        }
+    }
+
+    @NonNull
+    private static JSONObject windowNotFound(@NonNull JSONObject arguments) {
+        if (arguments.optString("id", "").trim().isEmpty()) {
+            return error(400, "bad_request", "Missing 'id'");
+        }
+        return error(404, "window_not_found",
+            "No window with id " + arguments.optString("id", "") + " in the current session");
+    }
+
+    /**
+     * A window the API may close: every pane in it was opened through the API, so closing it can
+     * never take a shell of the user's with it — not even one they split into the window later.
+     */
+    private static boolean isWindowOwned(@NonNull TerminalPaneController controller,
+                                         @NonNull TerminalPaneController.Window window) {
+        List<TerminalSession> shells = controller.shellsOf(window);
+        if (shells.isEmpty()) return false;
+        for (TerminalSession shell : shells) {
+            if (!AgentPaneRegistry.getInstance().isOwned(shell.mHandle)) return false;
+        }
+        return true;
+    }
+
+    /** One window as {@code pane.list} and {@code window.focus} report it, without its panes. */
+    @NonNull
+    private static JSONObject windowRecord(@NonNull TerminalHost host,
+                                           @NonNull TerminalPaneController.Window window,
+                                           int index) throws JSONException {
+        TerminalPaneController controller = host.paneController();
+        JSONObject record = new JSONObject();
+        record.put("index", index);
+        record.put("id", window.id);
+        String windowName = controller == null ? null : controller.windowName(window);
+        record.put("name", windowName == null ? JSONObject.NULL : windowName);
+        record.put("current", index == host.currentWindowIndex());
+        TerminalSession focused = controller == null ? null : controller.windowActiveSession(window);
+        record.put("focusedPane", focused == null ? JSONObject.NULL : focused.mHandle);
+        record.put("owned", controller != null && isWindowOwned(controller, window));
+        String layout = controller == null ? null : controller.layoutPolicyOf(window);
+        record.put("layout", layout == null ? JSONObject.NULL : layout);
+        return record;
+    }
+
+    /**
+     * The index of the window holding {@code session} among {@link TerminalHost#currentSessionWindows()}
+     * — the same numbering {@code pane.list} reports windows under — or -1 when there is no pane
+     * controller or the window cannot be found there (e.g. a different session's tab).
+     */
+    private static int windowIndexOf(@NonNull TerminalHost host, @NonNull TerminalSession session) {
+        TerminalPaneController controller = host.paneController();
+        if (controller == null) return -1;
+        TerminalPaneController.Window window = controller.windowOf(session);
+        if (window == null) return -1;
+        return host.currentSessionWindows().indexOf(window);
     }
 
     /** The last {@code count} lines of {@code text}, with trailing blank lines dropped. */

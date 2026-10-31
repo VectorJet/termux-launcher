@@ -36,6 +36,26 @@ public class Keyboard2View extends View
 
   /** Used to add fake pointers. */
   private KeyboardData.Key _compose_key;
+  /** The host is listening for voice input: the voice key draws as pressed. */
+  private boolean _voiceTypingActive;
+  /**
+   * Paste will put in a picture (one on the clipboard, or a fresh screenshot the launcher offers):
+   * the paste keys draw {@link #PASTE_PICTURE_GLYPH}.
+   */
+  private boolean _pasteShowsPicture;
+
+  /**
+   * Nerd Font nf-md-image, the paste keys' glyph while paste will put in a picture. A private-use
+   * code point without the key-font flag, so it is drawn in the symbols face ({@link LabelFace}).
+   */
+  static final String PASTE_PICTURE_GLYPH = new String(Character.toChars(0xF02E9));
+
+  /**
+   * [PASTE_PICTURE_GLYPH]'s size against the key's own: the Nerd Font picture fills its whole em
+   * square, where the key font's clipboard is 0.75 em wide, so at full size it towers over the
+   * glyphs beside it.
+   */
+  static final float PASTE_PICTURE_SCALE = 0.78f;
 
   private Pointers _pointers;
 
@@ -70,14 +90,6 @@ public class Keyboard2View extends View
 
   private Theme _theme;
   private Theme.Computed _tc;
-  private final Paint _splitBackgroundPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-  /**
-   * Host-set colour for the split slabs, or null to paint them in the keyboard's own background.
-   * The host owns this because a parted keyboard lies over the content rather than inside a
-   * surface of the host's, so the slabs are the panel and only the host knows which role that
-   * is. Local addition, see UPSTREAM.md.
-   */
-  private Integer _splitBackgroundColor;
   private final Paint _overrideBackgroundPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
   private final Paint _overrideBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
   private SparseArray<KeyColorOverride> _keyColorOverrides = new SparseArray<>();
@@ -105,22 +117,63 @@ public class Keyboard2View extends View
   private final ArrayList<TouchFx> _releasedTouchFx = new ArrayList<TouchFx>();
 
   /**
-   * Host hook that may move a press onto a neighbouring key before it is
-   * committed, and that is told where every tap landed. Local addition, see
-   * UPSTREAM.md. Consulted only for real touches, never for the colour-editor
-   * paint path.
+   * Host hook that may send a plain tap as a neighbouring key, and that is
+   * told about every release. Local addition, see UPSTREAM.md. Consulted only
+   * for real touches, never for the colour-editor paint path.
+   *
+   * <p>A press always holds the key under the finger-down point (the raw
+   * key): its highlight, swipe legends, long press and key repeat are that
+   * key's. Only a press released as a plain tap is offered to
+   * [resolveTap], just before the key is sent.
    */
   public interface TapResolver
   {
     /**
-     * Returns the index in [geometry] of the key the press should resolve to.
-     * Returning [rawIndex] or an invalid index leaves the press alone.
+     * A plain tap on [rawIndex] is being released; returns the index in
+     * [geometry] of the key to send. Returning [rawIndex] or an invalid index
+     * sends the raw key.
      */
     int resolveTap(TapGeometry geometry, int rawIndex, float x, float y);
 
-    /** A press has been released. [swiped] is true when the finger travelled. */
-    void observeTap(TapGeometry geometry, int rawIndex, float x, float y,
-        boolean swiped);
+    /** A press has been released, or cancelled. */
+    void observeTap(TapGeometry geometry, TapRelease release);
+  }
+
+  /**
+   * One released press, for [TapResolver.observeTap]. Positions and contact
+   * size are in [TapGeometry] units; times are [SystemClock.uptimeMillis].
+   */
+  public static final class TapRelease
+  {
+    public final int rawIndex;
+    /** The key that was sent; differs from [rawIndex] only on a corrected tap. */
+    public final int committedIndex;
+    /** The finger-down point. */
+    public final float x;
+    public final float y;
+    /** Released where it went down: no swipe, long press, repeat or slide. */
+    public final boolean plain;
+    /** Ctrl or Alt was held. */
+    public final boolean modified;
+    public final long downAtMs;
+    public final long upAtMs;
+    /** [MotionEvent.getTouchMajor] at finger-down; 0 when not reported. */
+    public final float contactSize;
+
+    public TapRelease(int rawIndex, int committedIndex, float x, float y,
+        boolean plain, boolean modified, long downAtMs, long upAtMs,
+        float contactSize)
+    {
+      this.rawIndex = rawIndex;
+      this.committedIndex = committedIndex;
+      this.x = x;
+      this.y = y;
+      this.plain = plain;
+      this.modified = modified;
+      this.downAtMs = downAtMs;
+      this.upAtMs = upAtMs;
+      this.contactSize = contactSize;
+    }
   }
 
   private TapResolver _tapResolver;
@@ -200,18 +253,7 @@ public class Keyboard2View extends View
     _fxFillPaint.setColor(_theme.pressedColor);
     _fxStrokePaint.setColor(_theme.pressedColor);
     _fxHaloPaint.setColor(_theme.pressedColor);
-    applyKeyboardBackground();
-  }
-
-  /**
-   * The keyboard's own background. Docked it is the view's, filling it; split, the view keeps
-   * none and {@link #drawSplitBackground} paints it under the key runs alone, so the parting
-   * shows whatever lies beneath the keyboard.
-   */
-  private void applyKeyboardBackground()
-  {
-    setBackgroundColor(_splitGapUnits > 0f ? Color.TRANSPARENT
-        : withOpacity(_theme.colorKeyboard, _theme.opacity));
+    setBackgroundColor(withOpacity(_theme.colorKeyboard, _theme.opacity));
   }
 
   /** Brief host-triggered wave that subtly modulates each key as the dock front reaches it. */
@@ -365,28 +407,79 @@ public class Keyboard2View extends View
   /** 1 = hint colors at full strength, 0 = fully returned to the underlying colors. */
   private float _hintFade = 1f;
 
-  /** The hint override blended toward what the key would paint without it. */
-  private KeyColorOverride fadeHintOverride(KeyColorOverride hint, KeyColorOverride base,
-      Theme.Computed.Key tc)
+  /**
+   * One key's override colors for one draw, as primitives: a set flag and a color per slot. The
+   * per-key loop fills a single instance, so lit keys box no Integers and the hint fade-out
+   * allocates no override per key per frame.
+   */
+  private static final class OverrideSlots
   {
-    return new KeyColorOverride(
-        fadeHintColor(hint.keyBackground, base == null ? null : base.keyBackground,
-            tc.bg_paint.getColor()),
-        fadeHintColor(hint.primaryLabel, base == null ? null : base.primaryLabel, tc.labelColor),
-        fadeHintColor(hint.secondaryLabel, base == null ? null : base.secondaryLabel,
-            tc.subLabelColor),
-        fadeHintColor(hint.secondaryBottomLabel,
-            base == null ? null : base.secondaryBottomLabel, tc.subLabelColor),
-        fadeHintColor(hint.borderColor, base == null ? null : base.borderColor,
-            tc.border_left_paint.getColor()));
+    boolean hasBackground, hasPrimary, hasSecondary, hasSecondaryBottom, hasBorder;
+    int background, primary, secondary, secondaryBottom, border;
+
+    void clear()
+    {
+      hasBackground = hasPrimary = hasSecondary = hasSecondaryBottom = hasBorder = false;
+    }
+
+    /** The override's own colors, unchanged. */
+    void set(KeyColorOverride o)
+    {
+      hasBackground = o.keyBackground != null;
+      if (hasBackground) background = o.keyBackground;
+      hasPrimary = o.primaryLabel != null;
+      if (hasPrimary) primary = o.primaryLabel;
+      hasSecondary = o.secondaryLabel != null;
+      if (hasSecondary) secondary = o.secondaryLabel;
+      hasSecondaryBottom = o.secondaryBottomLabel != null;
+      if (hasSecondaryBottom) secondaryBottom = o.secondaryBottomLabel;
+      hasBorder = o.borderColor != null;
+      if (hasBorder) border = o.borderColor;
+    }
   }
 
-  private Integer fadeHintColor(Integer hintColor, Integer baseColor, int themeDefault)
+  private final OverrideSlots _overrideSlots = new OverrideSlots();
+
+  /** The hint override blended toward what the key would paint without it, into [out]. */
+  private void fadeHintOverride(KeyColorOverride hint, KeyColorOverride base,
+      Theme.Computed.Key tc, OverrideSlots out)
+  {
+    out.hasBackground = fadeHintColor(hint.keyBackground,
+        base == null ? null : base.keyBackground, tc.bg_paint.getColor());
+    out.background = _fadedColor;
+    out.hasPrimary = fadeHintColor(hint.primaryLabel, base == null ? null : base.primaryLabel,
+        tc.labelColor);
+    out.primary = _fadedColor;
+    out.hasSecondary = fadeHintColor(hint.secondaryLabel,
+        base == null ? null : base.secondaryLabel, tc.subLabelColor);
+    out.secondary = _fadedColor;
+    out.hasSecondaryBottom = fadeHintColor(hint.secondaryBottomLabel,
+        base == null ? null : base.secondaryBottomLabel, tc.subLabelColor);
+    out.secondaryBottom = _fadedColor;
+    out.hasBorder = fadeHintColor(hint.borderColor, base == null ? null : base.borderColor,
+        tc.border_left_paint.getColor());
+    out.border = _fadedColor;
+  }
+
+  /** [fadeHintColor]'s answer when it has one. */
+  private int _fadedColor;
+
+  /**
+   * Whether the slot is overridden at all; when it is, its color is left in [_fadedColor]: the
+   * hint's color faded toward the base override, or toward the theme default without one.
+   */
+  private boolean fadeHintColor(Integer hintColor, Integer baseColor, int themeDefault)
   {
     if (hintColor == null)
-      return baseColor;
+    {
+      if (baseColor == null)
+        return false;
+      _fadedColor = baseColor;
+      return true;
+    }
     int target = baseColor != null ? baseColor : themeDefault;
-    return lerpColor(target, hintColor, _hintFade);
+    _fadedColor = lerpColor(target, hintColor, _hintFade);
+    return true;
   }
 
   private static int lerpColor(int from, int to, float t)
@@ -644,26 +737,6 @@ public class Keyboard2View extends View
     return withOpacity(_theme.colorKeyboard, _theme.opacity);
   }
 
-  /**
-   * The colour the split slabs are painted in. Null restores the keyboard's own background, so
-   * a host that says nothing gets what upstream draws. Local addition, see UPSTREAM.md.
-   */
-  public void setSplitBackgroundColor(Integer color)
-  {
-    requireMainThread();
-    if (Objects.equals(_splitBackgroundColor, color))
-      return;
-    _splitBackgroundColor = color;
-    invalidate();
-  }
-
-  /** The resolved slab colour: the host's when it set one, the keyboard's background otherwise. */
-  public int getSplitBackgroundColor()
-  {
-    return _splitBackgroundColor != null ? _splitBackgroundColor
-        : withOpacity(_theme.colorKeyboard, _theme.opacity);
-  }
-
   /** Label color used by transient host controls drawn against the keyboard palette. */
   public int getKeyboardLabelColor()
   {
@@ -690,10 +763,10 @@ public class Keyboard2View extends View
 
   /**
    * Parts the keyboard for the split type: the layout the host hands in is already parted, and
-   * this is the gap it was parted by, in key-width units. The view then paints its background
-   * under the key runs alone and lets a press that starts in the parting fall through to what is
-   * beneath it. Zero — the default — is the docked keyboard, which is untouched. Local addition,
-   * see UPSTREAM.md.
+   * this is the gap it was parted by, in key-width units. Only the keys part: the background
+   * still fills the view, and a press in the parting is the keyboard's, doing nothing, like any
+   * press that misses a key. Zero — the default — is the docked keyboard. Local addition, see
+   * UPSTREAM.md.
    */
   public void setSplitGapUnits(float gapUnits)
   {
@@ -703,7 +776,6 @@ public class Keyboard2View extends View
     if (Float.compare(_splitGapUnits, units) == 0)
       return;
     _splitGapUnits = units;
-    applyKeyboardBackground();
     requestLayout();
     invalidate();
   }
@@ -714,24 +786,96 @@ public class Keyboard2View extends View
   }
 
   /**
-   * The band the parting leaves empty on every row, in view pixels, for a host that wants to
-   * stand something in the gap. False, leaving [out] alone, when the keyboard is not split, has
-   * not been measured, or its rows share no band.
+   * The strip between the two key runs, in view pixels and the view's full height, for a host
+   * that wants to stand something in the parting: the band no row has a key in, from the cell
+   * edge of the left run to that of the right. False, leaving [out] alone, when the keyboard is
+   * not split or has not been measured. The width is rounded as a whole, so a strip asked for in
+   * whole pixels measures them.
    */
   public boolean getSplitGapBounds(Rect out)
   {
-    if (_splitGapUnits <= 0f || _keyboard == null || _tc == null || _keyWidth <= 0f)
-      return false;
-    float[] band = SplitLayout.commonGap(_keyboard, _splitGapUnits);
+    float[] band = splitBandPx();
     if (band == null)
       return false;
-    int left = Math.round(_marginLeft + band[0] * _keyWidth);
-    int right = Math.round(_marginLeft + band[1] * _keyWidth);
+    int left = Math.round(band[0]);
+    int right = left + Math.round(band[1] - band[0]);
     int height = getHeight() > 0 ? getHeight() : getMeasuredHeight();
     if (right <= left || height <= 0)
       return false;
     out.set(left, 0, right, height);
     return true;
+  }
+
+  /**
+   * Where a key standing in the parting would be drawn, in view pixels: the strip
+   * {@link #getSplitGapBounds} reports, inset by the spacing keys keep from each other, from the
+   * top of the first row's caps to the bottom of the last row's. A host panel laid out there
+   * with {@link #getKeyCapRadiusPx} reads as one more key. False, leaving [out] alone, when there
+   * is no parting or it is too thin to hold one.
+   */
+  public boolean getSplitGapKeyBounds(Rect out)
+  {
+    float[] band = splitBandPx();
+    if (band == null)
+      return false;
+    float top = 0f;
+    float bottom = 0f;
+    boolean first = true;
+    float y = getPaddingTop() + _tc.margin_top;
+    for (KeyboardData.Row row : _keyboard.rows)
+    {
+      y += row.shift * _tc.row_height;
+      if (first)
+        top = y;
+      first = false;
+      bottom = y + row.height * _tc.row_height - _tc.vertical_margin;
+      y += row.height * _tc.row_height;
+    }
+    // A cap stands half a key margin in from its cell, so the strip's edge, a cell edge, is
+    // half a margin from the caps beside it; half a margin more is a whole one.
+    int left = Math.round(band[0] + _tc.margin_left);
+    int right = Math.round(band[1] - _tc.margin_left);
+    if (right <= left || bottom <= top)
+      return false;
+    out.set(left, Math.round(top), right, Math.round(bottom));
+    return true;
+  }
+
+  /**
+   * The parting's band in view pixels, {left, right}; null when the keyboard is not parted or has
+   * not been measured.
+   */
+  private float[] splitBandPx()
+  {
+    if (_splitGapUnits <= 0f || _keyboard == null || _tc == null || _keyWidth <= 0f)
+      return null;
+    float[] band = SplitLayout.gapBand(_keyboard, _splitGapUnits);
+    if (band == null)
+      return null;
+    band[0] = _marginLeft + band[0] * _keyWidth;
+    band[1] = _marginLeft + band[1] * _keyWidth;
+    return band;
+  }
+
+  /**
+   * The radius of the key caps' outline, in px: their fill's corner out to the outer edge of
+   * their stroke. Zero until the view has been measured once.
+   */
+  public float getKeyCapRadiusPx()
+  {
+    if (_tc == null)
+      return 0f;
+    Theme.Computed.Key cap = _tc.key;
+    return cap.border_radius + cap.border_width / 2f;
+  }
+
+  /**
+   * A letter key's cap fill, its opacity included, for a host panel standing among the keys.
+   * Transparent until the view has been measured once.
+   */
+  public int getKeyCapColor()
+  {
+    return _tc == null ? Color.TRANSPARENT : _tc.key.bg_paint.getColor();
   }
 
   /**
@@ -742,17 +886,6 @@ public class Keyboard2View extends View
   public float getKeyContentWidthPx()
   {
     return _keyContentWidth;
-  }
-
-  /**
-   * The corner radius of the slabs {@link #drawSplitBackground} paints under the key runs, in
-   * px. Square: the slabs reach the view's edges and meet each other vertically, so a radius
-   * would only round the parting's inner edges. A host standing a panel in the parting reads
-   * it from here, so the three surfaces stay one shape.
-   */
-  public static float splitSlabRadiusPx()
-  {
-    return SPLIT_SLAB_RADIUS_PX;
   }
 
   /** Scales both horizontal and vertical gaps without replacing immutable Config. */
@@ -955,6 +1088,12 @@ public class Keyboard2View extends View
     return _config.labelFont;
   }
 
+  /** The face labels with icon glyphs are drawn in ([LabelFace.SYMBOL]). */
+  public android.graphics.Typeface symbolFont()
+  {
+    return _config.symbolFont != null ? _config.symbolFont : _config.labelFont;
+  }
+
   /** What a host needs to draw the popup for one pressed key. Immutable. */
   public static final class KeyPopupInfo
   {
@@ -1023,10 +1162,10 @@ public class Keyboard2View extends View
       {
         KeyValue kv = key.keys[i] == null ? null : modifyKey(key.keys[i], _mods);
         ringLabels[i] = popupLabel(kv);
-        ringKeyFont[i] = kv != null && kv.hasFlagsAny(KeyValue.FLAG_KEY_FONT);
+        ringKeyFont[i] = kv != null && drawnInKeyFont(kv);
       }
       KeyPopupInfo info = new KeyPopupInfo(bounds, label,
-          value.hasFlagsAny(KeyValue.FLAG_KEY_FONT), ringLabels, ringKeyFont, latchable);
+          drawnInKeyFont(value), ringLabels, ringKeyFont, latchable);
       _keyPopups.put(pointerId, info);
       listener.onKeyPopupShow(pointerId, info);
     }
@@ -1041,7 +1180,7 @@ public class Keyboard2View extends View
       if (label == null)
         return;
       listener.onKeyPopupTarget(pointerId, label,
-          value != null && value.hasFlagsAny(KeyValue.FLAG_KEY_FONT), slot);
+          value != null && drawnInKeyFont(value), slot);
     }
 
     @Override
@@ -1081,7 +1220,7 @@ public class Keyboard2View extends View
     if (kv == null)
       return null;
     kv = shiftedKeyeventLabel(kv);
-    String label = kv.getString();
+    String label = drawnString(kv);
     if (label == null || label.isEmpty())
       return null;
     // Same clamp the caps use, so a long macro reads the same in both places.
@@ -1174,8 +1313,8 @@ public class Keyboard2View extends View
     Vertical v = LABEL_POSITION_V[sub_index];
     Theme.Computed.Key tc_key = themeKeyFor(k.role);
     float textSize = scaleTextSize(kv, false);
-    Paint p = tc_key.sublabel_paint(kv.hasFlagsAny(KeyValue.FLAG_KEY_FONT),
-        tc_key.subLabelColor, textSize, a);
+    String label = drawnString(kv);
+    Paint p = tc_key.sublabel_paint(drawnInKeyFont(kv), label, tc_key.subLabelColor, textSize, a);
     float subPadding = _config.keyPaddingPx;
     if (a != Paint.Align.CENTER && v != Vertical.CENTER)
       subPadding += tc_key.border_radius * 0.3f;
@@ -1189,7 +1328,6 @@ public class Keyboard2View extends View
       anchor += keyW / 2f;
     else
       anchor += (a == Paint.Align.LEFT) ? subPadding : keyW - subPadding;
-    String label = kv.getString();
     int label_len = label.length();
     if (label_len > 3 && kv.getKind() == KeyValue.Kind.String)
       label_len = 3;
@@ -1315,6 +1453,94 @@ public class Keyboard2View extends View
     set_fake_ptr_latched(_shift_key, KeyValue.SHIFT, locked, true);
   }
 
+  /**
+   * Draws whichever key carries the voice-typing event as pressed while the host is listening,
+   * without touching the pointer state: the key can sit in a corner slot of another key, and a
+   * latched pointer would count as a modifier.
+   */
+  public void setVoiceTypingActive(boolean active)
+  {
+    requireMainThread();
+    if (_voiceTypingActive == active)
+      return;
+    _voiceTypingActive = active;
+    invalidate();
+  }
+
+  /**
+   * Draws the paste keys with a photo glyph while paste will put in a picture, so the user can see
+   * it will insert one. Only the glyph changes; the keys still send paste.
+   */
+  public void setPasteShowsPicture(boolean showsPicture)
+  {
+    requireMainThread();
+    if (_pasteShowsPicture == showsPicture)
+      return;
+    _pasteShowsPicture = showsPicture;
+    invalidate();
+  }
+
+  /**
+   * Whether [kv], already modified, is a paste the photo glyph stands in for. A modifier turns
+   * paste into pasteAsPlainText, which swaps too: a clipboard picture pastes all the same, while
+   * the launcher has plain paste put in the clipboard rather than an offered screenshot.
+   */
+  private boolean showsPictureGlyph(KeyValue kv)
+  {
+    if (!_pasteShowsPicture || kv.getKind() != KeyValue.Kind.Editing)
+      return false;
+    KeyValue.Editing editing = kv.getEditing();
+    return editing == KeyValue.Editing.PASTE || editing == KeyValue.Editing.PASTE_PLAIN;
+  }
+
+  /** The text a cap, corner or popup draws for [kv], already modified. */
+  private String drawnString(KeyValue kv)
+  {
+    return showsPictureGlyph(kv) ? PASTE_PICTURE_GLYPH : kv.getString();
+  }
+
+  /** Whether [kv], already modified, is drawn in the bundled key font. */
+  private boolean drawnInKeyFont(KeyValue kv)
+  {
+    return kv.hasFlagsAny(KeyValue.FLAG_KEY_FONT) && !showsPictureGlyph(kv);
+  }
+
+  /** The label [drawLabel] and [drawSubLabel] draw for the layout value [kv]; for tests. */
+  String labelForDrawing(KeyValue kv)
+  {
+    kv = modifyKey(kv, _mods);
+    return kv == null ? null : drawnString(shiftedKeyeventLabel(kv));
+  }
+
+  /** The size [drawLabel] or [drawSubLabel] draws the layout value [kv] at; for tests. */
+  float labelSizeForDrawing(KeyValue kv, boolean mainLabel)
+  {
+    kv = modifyKey(kv, _mods);
+    return kv == null ? 0f : scaleTextSize(shiftedKeyeventLabel(kv), mainLabel);
+  }
+
+  /** The face [labelForDrawing] is drawn in; for tests. */
+  LabelFace labelFaceForDrawing(KeyValue kv)
+  {
+    kv = modifyKey(kv, _mods);
+    if (kv == null)
+      return null;
+    kv = shiftedKeyeventLabel(kv);
+    return LabelFace.of(drawnInKeyFont(kv), drawnString(kv));
+  }
+
+  private static boolean isVoiceTypingKey(KeyboardData.Key k)
+  {
+    for (KeyValue kv : k.keys)
+    {
+      if (kv != null && kv.getKind() == KeyValue.Kind.Event
+          && (kv.getEvent() == KeyValue.Event.SWITCH_VOICE_TYPING
+            || kv.getEvent() == KeyValue.Event.SWITCH_VOICE_TYPING_CHOOSER))
+        return true;
+    }
+    return false;
+  }
+
   void set_fake_ptr_latched(KeyboardData.Key key, KeyValue kv, boolean latched,
       boolean lock)
   {
@@ -1427,7 +1653,7 @@ public class Keyboard2View extends View
       case MotionEvent.ACTION_UP:
       case MotionEvent.ACTION_POINTER_UP:
         p = event.getActionIndex();
-        observeTap(_touchFx.get(event.getPointerId(p)));
+        settleTap(event.getPointerId(p));
         finishTouchFx(event.getPointerId(p));
         _pointers.onTouchUp(event.getPointerId(p));
         _trails.remove(event.getPointerId(p));
@@ -1439,17 +1665,12 @@ public class Keyboard2View extends View
         p = event.getActionIndex();
         float tx = event.getX(p);
         float ty = event.getY(p);
-        KeyboardData.Key rawKey = getKeyAtPosition(tx, ty);
-        // The parting of a split keyboard is not the keyboard's: refusing the press hands the
-        // whole stream to whatever is under the gap.
-        if (rawKey == null && _splitGapUnits > 0f)
-          return false;
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN)
           requestDisallowIntercept(true);
-        KeyboardData.Key key = resolveTap(rawKey, tx, ty);
+        KeyboardData.Key key = getKeyAtPosition(tx, ty);
         if (key != null)
         {
-          startTouchFx(event.getPointerId(p), key, rawKey, tx, ty);
+          startTouchFx(event.getPointerId(p), key, tx, ty, event.getTouchMajor(p));
           _pointers.onTouchDown(tx, ty, event.getPointerId(p), key);
           if (_config.swipeTrailEnabled)
             _trails.put(event.getPointerId(p), new Trail(tx, ty));
@@ -1466,6 +1687,7 @@ public class Keyboard2View extends View
         }
         break;
       case MotionEvent.ACTION_CANCEL:
+        reportCancelledTaps();
         finishAllTouchFx();
         _pointers.onTouchCancelCommit();
         _trails.clear();
@@ -1478,13 +1700,15 @@ public class Keyboard2View extends View
     return (true);
   }
 
-  private void startTouchFx(int pointerId, KeyboardData.Key key,
-      KeyboardData.Key rawKey, float x, float y)
+  private void startTouchFx(int pointerId, KeyboardData.Key key, float x, float y,
+      float contactPx)
   {
     TouchFx previous = _touchFx.get(pointerId);
     if (previous != null)
       releaseTouchFx(previous, SystemClock.uptimeMillis());
-    _touchFx.put(pointerId, new TouchFx(key, rawKey, x, y, SystemClock.uptimeMillis()));
+    TouchFx fx = new TouchFx(key, x, y, SystemClock.uptimeMillis());
+    fx.contactPx = contactPx > 0f ? contactPx : 0f;
+    _touchFx.put(pointerId, fx);
   }
 
   /** Lazily rebuilds the tap geometry for the current layout and measurement. */
@@ -1502,35 +1726,60 @@ public class Keyboard2View extends View
     return (py - getPaddingTop() - _config.marginTopPx) / _keyWidth;
   }
 
-  /** The key a real press resolves to: [rawKey] unless the resolver moves it. */
-  private KeyboardData.Key resolveTap(KeyboardData.Key rawKey, float tx, float ty)
+  /**
+   * Called on release, before [Pointers.onTouchUp] sends the key. A plain tap
+   * may be sent as the key the resolver names; every release is reported.
+   */
+  private void settleTap(int pointerId)
   {
-    if (rawKey == null || _tapResolver == null)
-      return rawKey;
+    TouchFx fx = _touchFx.get(pointerId);
+    if (fx == null || fx.key == null || _tapResolver == null)
+      return;
     TapGeometry geometry = tapGeometry();
     if (geometry == null)
-      return rawKey;
-    int rawIndex = geometry.indexOf(rawKey);
+      return;
+    int rawIndex = geometry.indexOf(fx.key);
     if (rawIndex < 0)
-      return rawKey;
-    int index = _tapResolver.resolveTap(geometry, rawIndex, tapUnitsX(tx), tapUnitsY(ty));
-    if (index < 0 || index >= geometry.keyCount)
-      return rawKey;
-    return geometry.keys[index];
+      return;
+    float x = tapUnitsX(fx.downX);
+    float y = tapUnitsY(fx.downY);
+    Pointers.Modifiers mods = fx.swiped ? null : _pointers.plainTapModifiers(pointerId);
+    boolean plain = mods != null;
+    boolean modified = plain && Pointers.holdsCtrlOrAlt(mods);
+    int committed = rawIndex;
+    // A shortcut is never guessed at: with Ctrl or Alt held the raw key is sent.
+    if (plain && !modified)
+    {
+      int index = _tapResolver.resolveTap(geometry, rawIndex, x, y);
+      if (index != rawIndex && index >= 0 && index < geometry.keyCount
+          && geometry.keys[index] != null
+          && _pointers.retargetPlainTap(pointerId, geometry.keys[index]))
+        committed = index;
+    }
+    _tapResolver.observeTap(geometry, new TapRelease(rawIndex, committed, x, y,
+          plain, modified, fx.downAt,
+          SystemClock.uptimeMillis(), fx.contactPx / _keyWidth));
   }
 
-  private void observeTap(TouchFx fx)
+  /** The system took the touch stream; nothing pressed was a plain tap. */
+  private void reportCancelledTaps()
   {
-    if (fx == null || fx.rawKey == null || _tapResolver == null)
+    if (_tapResolver == null || _touchFx.size() == 0)
       return;
     TapGeometry geometry = tapGeometry();
     if (geometry == null)
       return;
-    int rawIndex = geometry.indexOf(fx.rawKey);
-    if (rawIndex < 0)
-      return;
-    _tapResolver.observeTap(geometry, rawIndex, tapUnitsX(fx.downX),
-        tapUnitsY(fx.downY), fx.swiped);
+    long now = SystemClock.uptimeMillis();
+    for (int i = 0; i < _touchFx.size(); i++)
+    {
+      TouchFx fx = _touchFx.valueAt(i);
+      int rawIndex = fx == null ? -1 : geometry.indexOf(fx.key);
+      if (rawIndex < 0)
+        continue;
+      _tapResolver.observeTap(geometry, new TapRelease(rawIndex, rawIndex,
+            tapUnitsX(fx.downX), tapUnitsY(fx.downY), false, false, fx.downAt,
+            now, fx.contactPx / _keyWidth));
+    }
   }
 
   private void updateTouchFx(int pointerId, float x, float y)
@@ -1753,47 +2002,6 @@ public class Keyboard2View extends View
     Vertical.BOTTOM
   };
 
-  /** The radius the run slabs are drawn with; {@link #splitSlabRadiusPx} is how a host reads it. */
-  private static final float SPLIT_SLAB_RADIUS_PX = 0f;
-
-  /**
-   * The keyboard background of a split keyboard: one slab under each run of keys, so the parting
-   * between the halves is left clear. Slabs meet vertically and reach both view edges, so the
-   * result is the docked background with the gap taken out of it.
-   */
-  private void drawSplitBackground(Canvas canvas)
-  {
-    _splitBackgroundPaint.setColor(getSplitBackgroundColor());
-    float y = getPaddingTop() + _tc.margin_top;
-    int lastRow = _keyboard.rows.size() - 1;
-    for (int rowIndex = 0; rowIndex <= lastRow; rowIndex++)
-    {
-      KeyboardData.Row row = _keyboard.rows.get(rowIndex);
-      float top = rowIndex == 0 ? 0f : y;
-      y += (row.shift + row.height) * _tc.row_height;
-      float bottom = rowIndex == lastRow ? getHeight() : y;
-      float x = _marginLeft;
-      float runLeft = 0f;
-      float runRight = -1f;
-      for (int keyIndex = 0; keyIndex < row.keys.size(); keyIndex++)
-      {
-        KeyboardData.Key key = row.keys.get(keyIndex);
-        float keyLeft = x + key.shift * _keyWidth;
-        if (keyIndex > 0 && SplitLayout.startsRun(key, _splitGapUnits))
-        {
-          canvas.drawRoundRect(runLeft, top, runRight, bottom,
-              SPLIT_SLAB_RADIUS_PX, SPLIT_SLAB_RADIUS_PX, _splitBackgroundPaint);
-          runLeft = keyLeft;
-        }
-        x = keyLeft + key.width * _keyWidth;
-        runRight = x;
-      }
-      if (runRight > runLeft)
-        canvas.drawRoundRect(runLeft, top, getWidth(), bottom,
-            SPLIT_SLAB_RADIUS_PX, SPLIT_SLAB_RADIUS_PX, _splitBackgroundPaint);
-    }
-  }
-
   @Override
   protected void onDraw(Canvas canvas)
   {
@@ -1804,8 +2012,6 @@ public class Keyboard2View extends View
     _launchWaveDensity = getResources().getDisplayMetrics().density;
     boolean animateNextFrame = false;
     int hintTraceIndex = 0;
-    if (_splitGapUnits > 0f)
-      drawSplitBackground(canvas);
     float y = getPaddingTop() + _tc.margin_top;
     for (int rowIndex = 0; rowIndex < _keyboard.rows.size(); rowIndex++)
     {
@@ -1823,7 +2029,8 @@ public class Keyboard2View extends View
             hintOverride != null ? hintOverride : schemeOverride;
         x += k.shift * _keyWidth;
         float keyW = _keyWidth * k.width - _tc.horizontal_margin;
-        boolean isKeyDown = _pointers.isKeyDown(k);
+        boolean isKeyDown = _pointers.isKeyDown(k)
+            || (_voiceTypingActive && isVoiceTypingKey(k));
         TouchFx touchFx = findTouchFx(k);
         float fxStrength = touchFx == null ? 0f : touchFx.strength(now);
         float launchStrength = launchWaveStrength(x + keyW / 2f, y + keyH / 2f);
@@ -1838,24 +2045,30 @@ public class Keyboard2View extends View
           tc_key = _tc.key_activated;
         else
           tc_key = paintFor(k);
-        if (hintOverride != null && _hintFadeAnimator != null)
+        // A key-down cap paints the theme's activated colors, whatever overrides it.
+        OverrideSlots slots = _overrideSlots;
+        slots.clear();
+        if (!isKeyDown && colorOverride != null)
         {
-          hintOverride = fadeHintOverride(hintOverride, schemeOverride, tc_key);
-          colorOverride = hintOverride;
+          if (hintOverride != null && _hintFadeAnimator != null)
+            fadeHintOverride(hintOverride, schemeOverride, tc_key, slots);
+          else
+            slots.set(colorOverride);
+          if (hintOverride != null)
+          {
+            // Only the hint lighting breathes; color-scheme overrides stay steady.
+            if (slots.hasBackground)
+              slots.background = hintBreathe(slots.background, keyIdValue);
+            if (slots.hasBorder)
+              slots.border = hintBreathe(slots.border, keyIdValue);
+          }
         }
-        Integer frameBackground =
-            isKeyDown || colorOverride == null ? null : colorOverride.keyBackground;
-        Integer frameBorder =
-            isKeyDown || colorOverride == null ? null : colorOverride.borderColor;
-        if (hintOverride != null)
-        {
-          // Only the hint lighting breathes; color-scheme overrides stay steady.
-          if (frameBackground != null)
-            frameBackground = hintBreathe(frameBackground, keyIdValue);
-          if (frameBorder != null)
-            frameBorder = hintBreathe(frameBorder, keyIdValue);
-        }
-        drawKeyFrame(canvas, x, y, keyW, keyH, tc_key, frameBackground, frameBorder);
+        // On a theme that draws no key borders only a colour-scheme border shows; the hint
+        // lighting's border stays a tint of an existing stroke, not a new outline.
+        boolean drawsBorder = slots.hasBorder && (tc_key.border_width > 0.f
+            || (schemeOverride != null && schemeOverride.borderColor != null));
+        drawKeyFrame(canvas, x, y, keyW, keyH, tc_key, slots.hasBackground, slots.background,
+            drawsBorder, slots.border);
         // The latched Ctrl/Alt/Shift caps are the hint popup's prefix indicator; trace them
         // while the hint lighting is up. Latched modifiers render as key-down.
         if (_hintColorOverrides.size() > 0 && _hintBreathAnimator != null && isKeyDown
@@ -1876,17 +2089,15 @@ public class Keyboard2View extends View
               fxStrength);
         if (k.keys[0] != null)
           drawLabel(canvas, k.keys[0], keyW / 2f + x, y, keyH, isKeyDown, tc_key,
-              isKeyDown || colorOverride == null ? null : colorOverride.primaryLabel);
+              slots.hasPrimary, slots.primary);
         for (int i = 1; i < 9; i++)
         {
           if (k.keys[i] != null)
           {
-            Integer labelOverride = null;
-            if (!isKeyDown && colorOverride != null)
-              labelOverride = (i == 3 || i == 4) && colorOverride.secondaryBottomLabel != null
-                  ? colorOverride.secondaryBottomLabel : colorOverride.secondaryLabel;
+            boolean bottom = (i == 3 || i == 4) && slots.hasSecondaryBottom;
             drawSubLabel(canvas, k.keys[i], x, y, keyW, keyH, i, isKeyDown, tc_key,
-                labelOverride);
+                bottom || slots.hasSecondary,
+                bottom ? slots.secondaryBottom : slots.secondary);
           }
         }
         drawIndication(canvas, k, x, y, keyW, keyH, _tc);
@@ -2062,14 +2273,18 @@ public class Keyboard2View extends View
 
   /** Draw borders and background of the key. */
   void drawKeyFrame(Canvas canvas, float x, float y, float keyW, float keyH,
-      Theme.Computed.Key tc, Integer backgroundOverride, Integer borderOverride)
+      Theme.Computed.Key tc, boolean hasBackgroundOverride, int backgroundOverride,
+      boolean hasBorderOverride, int borderOverride)
   {
     float r = tc.border_radius;
     float w = tc.border_width;
+    // A colour-scheme border on a theme that draws none still shows: 1dp in the chosen colour.
+    if (w <= 0.f && hasBorderOverride)
+      w = _launchWaveDensity;
     float padding = w / 2.f;
     _tmpRect.set(x + padding, y + padding, x + keyW - padding, y + keyH - padding);
     tc.positionGradient(y, keyH);
-    if (backgroundOverride == null)
+    if (!hasBackgroundOverride)
       canvas.drawRoundRect(_tmpRect, r, r, tc.bg_paint);
     else
     {
@@ -2083,7 +2298,7 @@ public class Keyboard2View extends View
     }
     if (w > 0.f)
     {
-      if (borderOverride != null)
+      if (hasBorderOverride)
       {
         // One uniform stroke in the host-chosen color; overrides the theme's four
         // side colors regardless of whether they were uniform.
@@ -2166,21 +2381,23 @@ public class Keyboard2View extends View
   }
 
   private void drawLabel(Canvas canvas, KeyValue kv, float x, float y,
-      float keyH, boolean isKeyDown, Theme.Computed.Key tc, Integer colorOverride)
+      float keyH, boolean isKeyDown, Theme.Computed.Key tc, boolean hasColorOverride,
+      int colorOverride)
   {
     kv = modifyKey(kv, _mods);
     if (kv == null)
       return;
     kv = shiftedKeyeventLabel(kv);
     float textSize = scaleTextSize(kv, true);
-    int color = colorOverride == null ? labelColor(kv, isKeyDown, false, tc) : colorOverride;
-    Paint p = tc.label_paint(kv.hasFlagsAny(KeyValue.FLAG_KEY_FONT), color, textSize);
-    canvas.drawText(kv.getString(), x, (keyH - p.ascent() - p.descent()) / 2f + y, p);
+    int color = hasColorOverride ? colorOverride : labelColor(kv, isKeyDown, false, tc);
+    String label = drawnString(kv);
+    Paint p = tc.label_paint(drawnInKeyFont(kv), label, color, textSize);
+    canvas.drawText(label, x, (keyH - p.ascent() - p.descent()) / 2f + y, p);
   }
 
   private void drawSubLabel(Canvas canvas, KeyValue kv, float x, float y,
       float keyW, float keyH, int sub_index, boolean isKeyDown,
-      Theme.Computed.Key tc, Integer colorOverride)
+      Theme.Computed.Key tc, boolean hasColorOverride, int colorOverride)
   {
     Paint.Align a = LABEL_POSITION_H[sub_index];
     Vertical v = LABEL_POSITION_V[sub_index];
@@ -2189,8 +2406,9 @@ public class Keyboard2View extends View
       return;
     kv = shiftedKeyeventLabel(kv);
     float textSize = scaleTextSize(kv, false);
-    int color = colorOverride == null ? labelColor(kv, isKeyDown, true, tc) : colorOverride;
-    Paint p = tc.sublabel_paint(kv.hasFlagsAny(KeyValue.FLAG_KEY_FONT), color, textSize, a);
+    int color = hasColorOverride ? colorOverride : labelColor(kv, isKeyDown, true, tc);
+    String label = drawnString(kv);
+    Paint p = tc.sublabel_paint(drawnInKeyFont(kv), label, color, textSize, a);
     float subPadding = _config.keyPaddingPx;
     // Corner-anchored sublabels sit where a large corner radius cuts the key
     // fill away; pull them inward with the radius so they stay on the cap.
@@ -2204,7 +2422,6 @@ public class Keyboard2View extends View
       x += keyW / 2f;
     else
       x += (a == Paint.Align.LEFT) ? subPadding : keyW - subPadding;
-    String label = kv.getString();
     int label_len = label.length();
     // Limit the label of string keys to 3 characters
     if (label_len > 3 && kv.getKind() == KeyValue.Kind.String)
@@ -2227,7 +2444,8 @@ public class Keyboard2View extends View
   {
     float smaller_font = k.hasFlagsAny(KeyValue.FLAG_SMALLER_FONT) ? 0.75f : 1.f;
     float label_size = main_label ? _mainLabelSize : _subLabelSize;
-    return label_size * smaller_font;
+    float picture = showsPictureGlyph(k) ? PASTE_PICTURE_SCALE : 1.f;
+    return label_size * smaller_font * picture;
   }
 
   private static final class Trail
@@ -2252,12 +2470,13 @@ public class Keyboard2View extends View
 
   private static final class TouchFx
   {
+    /** The key under the finger-down point, which the press holds throughout. */
     final KeyboardData.Key key;
-    /** The key the static grid resolved, before any tap correction. */
-    final KeyboardData.Key rawKey;
     final float downX;
     final float downY;
     final long downAt;
+    /** Contact size at finger-down, in px; 0 when the screen reports none. */
+    float contactPx;
     float x;
     float y;
     boolean swiped;
@@ -2266,10 +2485,9 @@ public class Keyboard2View extends View
     double angularTravel;
     long releasedAt = -1L;
 
-    TouchFx(KeyboardData.Key key, KeyboardData.Key rawKey, float x, float y, long downAt)
+    TouchFx(KeyboardData.Key key, float x, float y, long downAt)
     {
       this.key = key;
-      this.rawKey = rawKey;
       downX = x;
       downY = y;
       this.x = x;

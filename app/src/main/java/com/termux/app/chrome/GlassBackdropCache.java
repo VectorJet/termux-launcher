@@ -72,6 +72,19 @@ public final class GlassBackdropCache {
         AZ_STRIP,
         /** The dock plank and anything riding on it. */
         DOCK,
+        /**
+         * A terminal pane's glass slab, one rect per pane. Its ink is the terminal palette's own
+         * foreground and is never re-toned, so the pane answers with a veil alone; a split window
+         * is several rects of this one band, memoised per rect by {@code ChromeInk} rather than
+         * here, because this cache keeps one rect per band.
+         */
+        TERMINAL_PANE,
+        /**
+         * The in-app keyboard's host. Its ink is the key labels', measured on the key cap over the
+         * veiled host; the labels and the caps are the keyboard theme's, so only the host's veil
+         * moves.
+         */
+        KEYBOARD,
     }
 
     /** Reads the pixels behind a band. Implemented by the chrome renderer, faked in tests. */
@@ -80,8 +93,25 @@ public final class GlassBackdropCache {
          * The average opaque colour of the wallpaper under {@code screenRect}, or
          * {@link #UNREADABLE} when nothing can be read right now — no wallpaper frame, a live
          * wallpaper the app cannot capture, a blur still decoding. Never throws.
+         *
+         * <p>The rect is in the root container's own untransformed space: screen coordinates as
+         * they are while the root is not scaled, which is the space the wallpaper frame is
+         * captured in. {@code ChromeInk} maps a band into it, so a root the editor has scaled
+         * down is still sampled over the wallpaper it really shows.</p>
          */
         @ColorInt int sampleWallpaper(@NonNull Rect screenRect);
+
+        /**
+         * {@link #sampleWallpaper(Rect)} off the wallpaper as blurred at {@code blurRadiusDp}: the
+         * frame a surface drawn at that radius really shows. A row a few dozen dp tall averages
+         * differently under a 7 dp blur than under a 25 dp one, which mixes the rows above and
+         * below into it. {@link #UNREADABLE} while that radius is not resident. By default the
+         * plain sample, for a sampler that keeps one picture.
+         */
+        @ColorInt
+        default int sampleWallpaper(@NonNull Rect screenRect, int blurRadiusDp) {
+            return sampleWallpaper(screenRect);
+        }
     }
 
     /** What a {@link Sampler} returns when it has nothing: fully transparent, so it cannot be a colour. */
@@ -184,6 +214,31 @@ public final class GlassBackdropCache {
     }
 
     /**
+     * One read through the sampler, remembered nowhere: the opaque wallpaper colour under
+     * {@code rect}, or {@link #UNREADABLE} when there is no sampler, the rect is empty or nothing
+     * can be read yet. For a caller that memoises per rect itself — a band with several rects,
+     * which the one-rect-per-band entries here would make take turns re-sampling.
+     */
+    @ColorInt
+    public int sampleUncached(@NonNull Rect rect) {
+        if (mSampler == null || rect.isEmpty()) return UNREADABLE;
+        int read = mSampler.sampleWallpaper(rect);
+        return Color.alpha(read) == 0 ? UNREADABLE : OnGlass.opaque(read);
+    }
+
+    /**
+     * {@link #sampleUncached(Rect)} off the wallpaper as blurred at {@code blurRadiusDp}
+     * ({@link Sampler#sampleWallpaper(Rect, int)}); {@link #UNREADABLE} while that frame is not
+     * resident.
+     */
+    @ColorInt
+    public int sampleUncached(@NonNull Rect rect, int blurRadiusDp) {
+        if (mSampler == null || rect.isEmpty()) return UNREADABLE;
+        int read = mSampler.sampleWallpaper(rect, blurRadiusDp);
+        return Color.alpha(read) == 0 ? UNREADABLE : OnGlass.opaque(read);
+    }
+
+    /**
      * The raw wallpaper colour under {@code band}, sampled once per rect and generation. Returns
      * {@link #fallbackWallpaper()} when nothing has been read yet.
      */
@@ -259,19 +314,32 @@ public final class GlassBackdropCache {
                                         @ColorInt int backdrop, @ColorInt int preferredInk,
                                         @ColorInt int alternateInk, @ColorInt int veilColor,
                                         double target, @Nullable Boolean paleSide) {
+        return resolveOn(band, screenRect, backdrop, preferredInk, alternateInk, veilColor, target,
+            paleSide, OnGlass.MAX_VEIL_ALPHA_255);
+    }
+
+    /** {@link #resolveOn} with the veil held to {@code maxVeilAlpha255}; memoised with it. */
+    @NonNull
+    public OnGlass.Resolution resolveOn(@NonNull Band band, @NonNull Rect screenRect,
+                                        @ColorInt int backdrop, @ColorInt int preferredInk,
+                                        @ColorInt int alternateInk, @ColorInt int veilColor,
+                                        double target, @Nullable Boolean paleSide,
+                                        int maxVeilAlpha255) {
         Entry entry = entryFor(band, screenRect);
+        int ceilingKey = Math.max(0, Math.min(255, maxVeilAlpha255)) * 4;
         int sideKey = paleSide == null ? 0 : (paleSide ? 1 : -1);
         for (int i = 0; i < entry.memos.size(); i++) {
             Memo memo = entry.memos.get(i);
-            if (memo.matches(backdrop, BACKDROP_GIVEN + sideKey, preferredInk, alternateInk,
+            if (memo.matches(backdrop, BACKDROP_GIVEN + sideKey + ceilingKey, preferredInk, alternateInk,
                     veilColor, target)) {
                 return memo.resolution;
             }
         }
         OnGlass.Resolution resolution =
-            OnGlass.resolve(backdrop, preferredInk, alternateInk, veilColor, target, paleSide);
+            OnGlass.resolve(backdrop, preferredInk, alternateInk, veilColor, target, paleSide,
+                maxVeilAlpha255);
         if (entry.memos.size() >= MEMO_SLOTS) entry.memos.remove(entry.memos.size() - 1);
-        entry.memos.add(0, new Memo(resolution, backdrop, BACKDROP_GIVEN + sideKey, preferredInk,
+        entry.memos.add(0, new Memo(resolution, backdrop, BACKDROP_GIVEN + sideKey + ceilingKey, preferredInk,
             alternateInk, veilColor, target));
         return resolution;
     }

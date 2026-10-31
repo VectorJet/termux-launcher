@@ -35,6 +35,12 @@ import com.termux.app.launcher.model.LauncherAppEntry;
  * different amounts of pixel data depending on which sizes happen to be live.
  *
  * <p>Hot path: {@link #icon} allocates nothing on a hit beyond the key string.
+ *
+ * <p>Threads: {@link #peek} is for the main thread, which binds what is already held and nothing
+ * else; {@link #icon} may run on the icon thread, which is where a miss is rendered (see
+ * {@link AsyncIconBinder}). The cache is an {@link LruCache} and synchronised on its own, and a
+ * render that started before an invalidation or an icon-pack switch is dropped instead of stored,
+ * so the worker can never put back what the main thread just threw away.
  */
 public final class DockIconCache {
 
@@ -69,6 +75,12 @@ public final class DockIconCache {
      */
     public interface ArtworkSource {
         @Nullable Drawable artwork(@NonNull LauncherAppEntry entry);
+
+        /** {@link #artwork}, saying whether it is a stand-in not to be kept. By default never. */
+        @NonNull
+        default LauncherIconStore.Artwork artworkDetailed(@NonNull LauncherAppEntry entry) {
+            return LauncherIconStore.Artwork.kept(artwork(entry));
+        }
     }
 
     @NonNull private final Resources resources;
@@ -76,7 +88,13 @@ public final class DockIconCache {
     @Nullable private final ArtworkSource artworkSource;
     @NonNull private final LruCache<String, Drawable> cache;
     /** Which icon packs produced the artwork behind the current renders. See {@link #renderKey}. */
-    @NonNull private String iconPackIdentity = "";
+    @NonNull private volatile String iconPackIdentity = "";
+    /**
+     * Bumped by every {@link #invalidateAll()}. A render on the worker notes it before starting and
+     * stores its result only if it has not moved, so a render begun under the old treatment cannot
+     * land after the eviction that was meant to remove it.
+     */
+    private volatile int epoch;
 
     public DockIconCache(@NonNull Resources resources, int memoryClassMb,
                          @NonNull DefaultIconSource defaultIconSource) {
@@ -197,21 +215,37 @@ public final class DockIconCache {
      */
     @Nullable
     public Drawable icon(@NonNull LauncherAppEntry entry, int sizePx) {
-        Drawable raw = rawArtwork(entry);
         if (sizePx <= 0) {
-            return raw;
+            return rawArtwork(entry);
         }
+        int startEpoch = epoch;
+        String identity = iconPackIdentity;
         Badge badge = badgeFor(entry);
-        String key = renderKey(entry, sizePx, badge, iconPackIdentity);
+        String key = renderKey(entry, sizePx, badge, identity);
         Drawable cached = cache.get(key);
         if (cached != null) {
             return cached;
         }
+        LauncherIconStore.Artwork artwork = rawArtworkDetailed(entry);
+        Drawable raw = artwork.drawable;
         Drawable built = normalize(raw, sizePx, !entry.iconPackArtwork, badge);
-        if (built != null) {
+        // A stand-in is rendered for now and never kept: the pack it waits for redraws it.
+        if (built != null && !artwork.provisional
+            && startEpoch == epoch && identity.equals(iconPackIdentity)) {
             cache.put(key, built);
         }
         return built != null ? built : raw;
+    }
+
+    /**
+     * The rendered icon for {@code entry} at {@code sizePx} if it is already held, and null
+     * otherwise. Never loads or renders, so it is what the main thread asks while binding a cell:
+     * a hit binds now, a miss goes to the worker through {@link #icon}.
+     */
+    @Nullable
+    public Drawable peek(@NonNull LauncherAppEntry entry, int sizePx) {
+        if (sizePx <= 0) return null;
+        return cache.get(renderKey(entry, sizePx, badgeFor(entry), iconPackIdentity));
     }
 
     /**
@@ -220,13 +254,23 @@ public final class DockIconCache {
      */
     @Nullable
     public Drawable rawArtwork(@NonNull LauncherAppEntry entry) {
-        if (entry.icon != null) return entry.icon;
-        Drawable stored = artworkSource == null ? null : artworkSource.artwork(entry);
-        return stored != null ? stored : defaultIconSource.defaultIcon();
+        return rawArtworkDetailed(entry).drawable;
+    }
+
+    @NonNull
+    private LauncherIconStore.Artwork rawArtworkDetailed(@NonNull LauncherAppEntry entry) {
+        if (entry.icon != null) return LauncherIconStore.Artwork.kept(entry.icon);
+        LauncherIconStore.Artwork stored = artworkSource == null
+            ? LauncherIconStore.Artwork.kept(null) : artworkSource.artworkDetailed(entry);
+        if (stored.drawable != null) return stored;
+        Drawable fallback = defaultIconSource.defaultIcon();
+        return stored.provisional ? LauncherIconStore.Artwork.standIn(fallback)
+            : LauncherIconStore.Artwork.kept(fallback);
     }
 
     /** Drops every rendered icon; the next bind re-renders at the current treatment. */
     public void invalidateAll() {
+        epoch++;
         cache.evictAll();
     }
 
@@ -281,12 +325,15 @@ public final class DockIconCache {
 
         // Render the source at the footprint size so we can derive a silhouette shadow that follows
         // its native shape (adaptive icons draw their own masked bg+fg here, so shape is preserved).
+        // Drawn from a copy where one is cheap: the source is the store's shared artwork, which the
+        // main thread may be drawing at its own bounds while this runs on the worker.
+        Drawable drawable = drawingCopy(src);
         Bitmap iconBmp = Bitmap.createBitmap(iconRect.width(), iconRect.height(), Bitmap.Config.ARGB_8888);
         Canvas iconCanvas = new Canvas(iconBmp);
-        Rect oldBounds = new Rect(src.getBounds());
-        src.setBounds(0, 0, iconBmp.getWidth(), iconBmp.getHeight());
-        src.draw(iconCanvas);
-        src.setBounds(oldBounds);
+        Rect oldBounds = new Rect(drawable.getBounds());
+        drawable.setBounds(0, 0, iconBmp.getWidth(), iconBmp.getHeight());
+        drawable.draw(iconCanvas);
+        drawable.setBounds(oldBounds);
 
         // Saturation nudge toward the glass vibrancy (match, not grey), then draw the icon.
         Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
@@ -306,6 +353,22 @@ public final class DockIconCache {
         displayCanvas.drawBitmap(cleanArtwork, 0f, 0f,
             new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG));
         return new RenderedIconDrawable(resources, display, cleanArtwork);
+    }
+
+    /**
+     * A second instance over the same pixels, so drawing it at other bounds cannot disturb the
+     * original; the original itself when the drawable cannot make one.
+     */
+    @NonNull
+    private Drawable drawingCopy(@NonNull Drawable src) {
+        Drawable.ConstantState state = src.getConstantState();
+        if (state == null) return src;
+        try {
+            Drawable copy = state.newDrawable(resources);
+            return copy != null ? copy : src;
+        } catch (RuntimeException e) {
+            return src;
+        }
     }
 
     /** Small, neutral double-tile badge that remains legible over both bright and dark icons. */

@@ -64,6 +64,33 @@ import java.util.Map;
  * the other half of the same fact: it continues the pane's material but carries no content, so it
  * is nobody's band and asks for no veil of its own.</p>
  *
+ * <h3>Bands whose ink is not the chrome's</h3>
+ * <p>Two bands stand outside the ink half of all this: the terminal pane
+ * ({@link GlassBackdropCache.Band#TERMINAL_PANE}) and the in-app keyboard
+ * ({@link GlassBackdropCache.Band#KEYBOARD}). The terminal's foreground belongs to its palette and a
+ * key label to its keyboard theme, and neither is re-toned to suit a wallpaper, so these bands are
+ * answered with a veil alone ({@link OnGlass#resolveFixedInk}), up to the opaque ground their ink
+ * was authored for. They still vote: the polarity is decided from what <em>every</em> band stands
+ * on, and a terminal filling most of the screen is most of what the chrome is seen against. They
+ * never take the polarity back, because they have no ink to flip. A split window is several rects
+ * of the one pane band, each memoised here on its own rect ({@link #terminalPane}); the band's vote
+ * is the mean of its panes, so a split cannot outvote the rest of the chrome.</p>
+ *
+ * <h3>How hard, and where</h3>
+ * <p>Every target a band asks at is scaled by the user's one legibility control,
+ * {@link LegibilityLevel} (the "Terminal contrast" choice: body text at 3.0, 4.5 or 7.0), before
+ * anything is resolved. Callers keep asking in {@link OnGlass}'s tiers; the level is applied here,
+ * once, so no band can forget it.</p>
+ *
+ * <p>A band's rect is kept in the root container's own untransformed space, not on screen. The
+ * editor shows the launcher scaled down inside a frame by scaling {@code terminal_root_container},
+ * which carries the wallpaper backdrop with it, so a band drawn at three quarters size is still
+ * over the wallpaper pixels it covers at full size. {@link #onGlass} and {@link #backdropUnder}
+ * take the screen rects their callers have always passed and map them back through the root's
+ * scale and translation ({@link #mapIntoRoot}); the new bands pass laid-out rects, which already
+ * ignore every transform. Either way the memo is keyed on the root-space rect, so a scale animation
+ * does not re-sample every frame.</p>
+ *
  * <p>Main thread only, like the rest of the chrome renderer.</p>
  */
 public final class ChromeInk {
@@ -102,14 +129,88 @@ public final class ChromeInk {
         /** The veil the band last derived; only for noticing a change worth a repaint. */
         int veil = Color.TRANSPARENT;
         boolean seen;
+        /**
+         * True for a band whose ink is fixed ({@link #onFixedInk}): {@link #darkInk} is its ink,
+         * {@link #secondInk} a second ink held to the same target, {@link #cap} what stands
+         * between the veil and both.
+         */
+        boolean fixedInk;
+        int secondInk;
+        int cap = Color.TRANSPARENT;
+        /** What {@link #secondInk} stands on; {@link #cap} again when both share one cap. */
+        int secondCap = Color.TRANSPARENT;
+        /**
+         * A fixed-ink band whose content can draw either tone ({@link #onFixedInkEitherTone}):
+         * {@link #darkInk} and {@link #secondInk} are the dark pair, {@link #paleInk} and
+         * {@link #secondPaleInk} the pale one, and the tone is chosen on the bare face.
+         */
+        boolean eitherTone;
+        int secondPaleInk;
+        /** The tone last chosen ({@link #TONE_DARK}, {@link #TONE_PALE}), or 0 before any. */
+        int tone;
+        /** The last fixed-ink answer and every input it was searched from; null when stale. */
+        @Nullable OnGlass.Resolution fixedAnswer;
+        int fixedBackdrop;
+        int fixedSecondBackdrop;
+        int fixedVeilColor;
+        int fixedCap;
+        int fixedSecondCap;
+        int fixedInkAsked;
+        int fixedSecondInkAsked;
+        double fixedTarget;
     }
 
-    /** What a band's glass is, as far as measuring it goes: opacity, foot, and the slice it draws. */
+    /** One terminal pane's standing answer, remembered on its own rect. */
+    private static final class PaneAnswer {
+        int wallpaper;
+        boolean sampled;
+        int dim;
+        int tint;
+        int veilColor;
+        int ink;
+        int dimInk;
+        double target;
+        int flat;
+        @NonNull OnGlass.Resolution resolution;
+
+        PaneAnswer(@NonNull OnGlass.Resolution resolution) {
+            this.resolution = resolution;
+        }
+
+        boolean matches(int dim, int tint, int veilColor, int ink, int dimInk, double target) {
+            return this.dim == dim && this.tint == tint && this.veilColor == veilColor
+                && this.ink == ink && this.dimInk == dimInk
+                && Double.compare(this.target, target) == 0;
+        }
+    }
+
+    /** Panes a window can hold at once, and then some; an older rect is dropped, not an error. */
+    static final int MAX_PANE_ANSWERS = 8;
+
+    /**
+     * What a band's glass is, as far as measuring it goes: opacity, foot, the slice it draws, the
+     * base colour its tint is really drawn in (the Look's ink with the Tint control's accent mixed
+     * in).
+     */
     private static final class BandGlass {
         float opacity;
         boolean withFoot = true;
         float sliceStart;
         float sliceEnd = 1f;
+        /** Whether {@link #baseColor} was told; until then the mode's untinted base stands in. */
+        boolean tinted;
+        @ColorInt int baseColor;
+        /**
+         * The blur the band's glass is drawn at, dp ({@link #noteBandBlur}); -1 until told, when
+         * its rows are read off the frame the status bar or the dock is drawn at.
+         */
+        int blurRadiusDp = -1;
+    }
+
+    /** The base colour {@code glass}'s tint is drawn in: the tinted one it told, or the mode's. */
+    @ColorInt
+    private int baseOf(@NonNull BandGlass glass) {
+        return glass.tinted ? glass.baseColor : mBaseColor;
     }
 
     @NonNull private final ChromeRenderer.Surfaces mSurfaces;
@@ -130,7 +231,20 @@ public final class ChromeInk {
     @NonNull private final Map<GlassBackdropCache.Band, Integer> mVotes =
         new EnumMap<>(GlassBackdropCache.Band.class);
 
+    /** Each terminal pane's answer by its root-space rect, eldest first. Cleared by {@link #invalidate}. */
+    @NonNull private final java.util.LinkedHashMap<Rect, PaneAnswer> mPanes =
+        new java.util.LinkedHashMap<>(MAX_PANE_ANSWERS, 0.75f, true);
+
     @Nullable private Polarity mPolarity;
+    /**
+     * The pane band's mean flat glass as last measured; survives {@link #invalidate} so a
+     * re-sample replaces it instead of leaving a gap. Transparent until a pane is measured.
+     */
+    @ColorInt private int mPaneGround = Color.TRANSPARENT;
+    /** Told when {@link #mPaneGround} moves; see {@link #setOnTerminalPaneGroundChanged}. */
+    @Nullable private Runnable mOnPaneGroundChanged;
+    /** The user's legibility control as last read; every target is scaled by it. */
+    @NonNull private LegibilityLevel mLevel = LegibilityLevel.DEFAULT;
     @ColorInt private int mBaseColor;
     @ColorInt private int mAccentColor;
     @ColorInt private int mDimColor;
@@ -138,13 +252,24 @@ public final class ChromeInk {
 
     @NonNull private final Rect mTmpSampleRect = new Rect();
     @NonNull private final int[] mTmpLocation = new int[2];
+    @NonNull private final int[] mTmpRootLocation = new int[2];
+    @NonNull private final int[] mTmpRootScratch = new int[2];
+    @NonNull private final Rect mTmpRootRect = new Rect();
 
     ChromeInk(@NonNull ChromeRenderer.Surfaces surfaces, @NonNull WallpaperBlurCache blurCache,
               @Nullable Runnable onVeilChanged) {
         mSurfaces = surfaces;
         mBlurCache = blurCache;
         mOnVeilChanged = onVeilChanged;
-        mCache.setSampler(this::sampleWallpaper);
+        mCache.setSampler(new GlassBackdropCache.Sampler() {
+            @Override public int sampleWallpaper(@NonNull Rect screenRect) {
+                return ChromeInk.this.sampleWallpaper(screenRect, DEFAULT_FRAME);
+            }
+
+            @Override public int sampleWallpaper(@NonNull Rect screenRect, int blurRadiusDp) {
+                return ChromeInk.this.sampleWallpaper(screenRect, Math.max(0, blurRadiusDp));
+            }
+        });
     }
 
     // ------------------------------------------------------------------ the accessor
@@ -168,12 +293,14 @@ public final class ChromeInk {
      * caller in the frame would win.</p>
      *
      * @param band which chrome band the content sits on
-     * @param screenRect that band's rect in screen coordinates; a change re-samples the wallpaper
+     * @param screenRect that band's rect in screen coordinates; a change re-samples the wallpaper.
+     *     Mapped into the root container's untransformed space here ({@link #toRootSpace}), so a
+     *     scaled root is sampled over the wallpaper it really shows
      * @param darkInk the on-light ink for this content — the mode's dark role colour
      * @param paleInk the on-dark ink for it — the other role colour, for a band standing on a dark
      *     backdrop. Pass the same colour twice for content whose hue carries meaning of its own.
      * @param target one of {@link OnGlass#TARGET_BODY_TEXT}, {@link OnGlass#TARGET_LARGE_TEXT},
-     *     {@link OnGlass#TARGET_DECORATION}
+     *     {@link OnGlass#TARGET_DECORATION}, at the Default level; {@link LegibilityLevel} scales it
      */
     @NonNull
     public OnGlass.Resolution onGlass(@NonNull GlassBackdropCache.Band band,
@@ -182,12 +309,299 @@ public final class ChromeInk {
                                       double target) {
         readMode();
         Contract contract = contractFor(band);
-        contract.rect.set(screenRect);
+        toRootSpace(screenRect, contract.rect);
         contract.darkInk = darkInk;
         contract.paleInk = paleInk;
         contract.target = target;
+        contract.fixedInk = false;
         contract.seen = true;
         return resolveBand(band, contract);
+    }
+
+    /**
+     * {@link #onGlass} for a band whose ink is not the chrome's to choose: the in-app keyboard,
+     * whose key labels are its theme's and stand on its theme's key caps. The answer is a veil for
+     * the band's glass and nothing else — {@link OnGlass.Resolution#ink} is whichever given ink
+     * reads worst on it, never a re-toned one — and it is recorded exactly as {@link #onGlass}'s
+     * is, so {@link GlassSurfaceFactory} draws it from {@link #bandVeil} over the light model. The
+     * band still votes in the chrome's polarity; it just never takes one.
+     *
+     * @param rootRect the band's rect in the root container's untransformed space — a laid-out
+     *     rect, as {@link GlassAnchor#layoutOriginOnScreen} gives it; a change re-samples
+     * @param ink the band's ink (the key labels')
+     * @param secondInk a second ink held to the same target; {@code ink} again for none
+     * @param cap what stands between the band's glass and the ink — the key cap, alpha and all —
+     *     or {@link Color#TRANSPARENT}
+     * @param target an {@link OnGlass} tier at the Default level; {@link LegibilityLevel} scales it
+     */
+    @NonNull
+    public OnGlass.Resolution onFixedInk(@NonNull GlassBackdropCache.Band band,
+                                         @NonNull Rect rootRect, @ColorInt int ink,
+                                         @ColorInt int secondInk, @ColorInt int cap,
+                                         double target) {
+        return onFixedInk(band, rootRect, ink, cap, secondInk, cap, target);
+    }
+
+    /**
+     * {@link #onFixedInk(GlassBackdropCache.Band, Rect, int, int, int, double)} with the second
+     * ink on a cap of its own: the keyboard's function legends (Ctrl, Alt, Fn, the arrows) stand on
+     * a chip that lets more glass through than a letter key's. Each ink is measured on its own cap
+     * over the row of the band where it reads worst, and the band wears the larger of the two
+     * veils, so the veil rises for whichever legend no tone can carry.
+     */
+    @NonNull
+    public OnGlass.Resolution onFixedInk(@NonNull GlassBackdropCache.Band band,
+                                         @NonNull Rect rootRect, @ColorInt int ink,
+                                         @ColorInt int cap, @ColorInt int secondInk,
+                                         @ColorInt int secondCap, double target) {
+        readMode();
+        Contract contract = contractFor(band);
+        contract.rect.set(rootRect);
+        contract.darkInk = ink;
+        contract.paleInk = ink;
+        contract.secondInk = secondInk;
+        contract.cap = cap;
+        contract.secondCap = secondCap;
+        contract.target = target;
+        contract.fixedInk = true;
+        contract.eitherTone = false;
+        contract.seen = true;
+        return resolveBand(band, contract);
+    }
+
+    /** {@link Contract#tone}: dark legends. */
+    public static final int TONE_DARK = 1;
+    /** {@link Contract#tone}: pale legends. */
+    public static final int TONE_PALE = 2;
+    /**
+     * How much better, as a ratio of margins, the other tone must read on the bare face before a
+     * band that has chosen one switches: a face near the line keeps its legends instead of
+     * flipping on every pass as the sample moves by a step.
+     */
+    static final double TONE_HYSTERESIS = 1.1d;
+
+    /**
+     * {@link #onFixedInk(GlassBackdropCache.Band, Rect, int, int, int, int, double)} for content
+     * that draws whichever tone reads: the keyboard's legends. The tone is chosen on the bare face
+     * (the glass as composed, no veil), for the letter and the second legend together: the one
+     * that clears {@code target} there, or the one that reads better when both or neither do. A
+     * veil is bought only when the chosen tone still misses, and only as much as it needs (none
+     * where a veil of the band's base would not help it). The answer depends on the face alone,
+     * never on which legends were drawn before, so a launch and a live edit land on the same
+     * one; a band that has chosen keeps its tone until the other reads clearly better
+     * ({@link #TONE_HYSTERESIS}). The content then picks its legends on the faces
+     * ({@link #bandFaces}), which carry the veil when there is one.
+     *
+     * <p>Asked with dark legends drawn, a fixed-ink band used to buy a light veil under which
+     * they read (about 54% over dark grass at Opacity 10) where pale legends read bare: a milky
+     * keyboard that then kept its dark legends because they read on it.</p>
+     *
+     * @param darkInk the letter legend's dark tone; {@code paleInk} its pale one
+     * @param secondDarkInk the second legend (as drawn) in the dark tone; {@code secondPaleInk}
+     *     in the pale one
+     */
+    @NonNull
+    public OnGlass.Resolution onFixedInkEitherTone(@NonNull GlassBackdropCache.Band band,
+                                                   @NonNull Rect rootRect,
+                                                   @ColorInt int darkInk, @ColorInt int paleInk,
+                                                   @ColorInt int cap,
+                                                   @ColorInt int secondDarkInk,
+                                                   @ColorInt int secondPaleInk,
+                                                   @ColorInt int secondCap, double target) {
+        readMode();
+        Contract contract = contractFor(band);
+        contract.rect.set(rootRect);
+        contract.darkInk = darkInk;
+        contract.paleInk = paleInk;
+        contract.secondInk = secondDarkInk;
+        contract.secondPaleInk = secondPaleInk;
+        contract.cap = cap;
+        contract.secondCap = secondCap;
+        contract.target = target;
+        contract.fixedInk = true;
+        contract.eitherTone = true;
+        contract.seen = true;
+        return resolveBand(band, contract);
+    }
+
+    /**
+     * One terminal pane's answer: the veil its slab is drawn with so the palette's foreground
+     * reads at the body-text target and its dim foreground at the large-text target (both scaled
+     * by the legibility level), over the pane's own tint and in addition to it.
+     *
+     * <p>The pane has no light model — its glass is the frost, the terminal tint at the user's
+     * opacity, and grain — so what is measured is the wallpaper under the launcher's dim with the
+     * tint over it, and the veil moves that toward the terminal's own background. The foreground
+     * is never moved: it is the palette's, and the palette holds it to its own contrast against
+     * the opaque background this veil is allowed to climb to. The veil is drawn by
+     * {@code PaneGlassBackdropView} over the tint and under the rim.</p>
+     *
+     * <p>Memoised on the pane's rect, one entry per pane, so a split window's panes do not take
+     * turns re-sampling each other's wallpaper; any input moving, the rect moving, or
+     * {@link #invalidate} re-derives it. A pane asked about before the wallpaper is readable is
+     * answered on the mode's nominal glass and asks again next time, like every band.</p>
+     *
+     * @param rootRect the pane's laid-out rect, in the root container's untransformed space
+     * @param tint the pane's tint as drawn, alpha included (the user's terminal opacity); may be
+     *     transparent
+     * @param veilColor the terminal's own background, which the veil moves toward
+     * @param ink the palette's default foreground
+     * @param dimInk the same foreground dimmed, as the renderer draws faint text; held to the
+     *     large-text tier
+     */
+    @NonNull
+    public OnGlass.Resolution terminalPane(@NonNull Rect rootRect, @ColorInt int tint,
+                                           @ColorInt int veilColor, @ColorInt int ink,
+                                           @ColorInt int dimInk) {
+        readMode();
+        double target = mLevel.target(OnGlass.TARGET_BODY_TEXT);
+        PaneAnswer answer = mPanes.get(rootRect);
+        if (answer != null && answer.sampled
+                && answer.matches(mDimColor, tint, veilColor, ink, dimInk, target)) {
+            return answer.resolution;
+        }
+        int wallpaper;
+        boolean sampled;
+        if (answer != null && answer.sampled) {
+            wallpaper = answer.wallpaper;
+            sampled = true;
+        } else {
+            int read = mCache.sampleUncached(rootRect);
+            sampled = Color.alpha(read) != 0;
+            wallpaper = sampled ? read : mCache.fallbackWallpaper();
+        }
+        int flat = OnGlass.backdrop(wallpaper, mDimColor, tint);
+        // The normal foreground is body text; the dim one is text a program asked to recede, and
+        // is held to the large-text tier, scaled by the same level.
+        // The veil never takes the pane past its own opacity plus 15 points (20% to 55%): a pane
+        // the user made thin stays glass, and the ink is reported as capped instead.
+        int cap255 = veilCeiling255(tint);
+        OnGlass.Resolution resolution = OnGlass.resolveFixedInk(flat, Color.TRANSPARENT, ink,
+            target, dimInk, mLevel.target(OnGlass.TARGET_LARGE_TEXT), veilColor, cap255);
+        if (answer == null) {
+            answer = new PaneAnswer(resolution);
+            if (mPanes.size() >= MAX_PANE_ANSWERS) {
+                java.util.Iterator<Rect> eldest = mPanes.keySet().iterator();
+                eldest.next();
+                eldest.remove();
+            }
+            mPanes.put(new Rect(rootRect), answer);
+        }
+        answer.resolution = resolution;
+        answer.wallpaper = wallpaper;
+        answer.sampled = sampled;
+        answer.dim = mDimColor;
+        answer.tint = tint;
+        answer.veilColor = veilColor;
+        answer.ink = ink;
+        answer.dimInk = dimInk;
+        answer.target = target;
+        answer.flat = flat;
+        int ground = meanPaneVote(tint);
+        vote(GlassBackdropCache.Band.TERMINAL_PANE, ground);
+        if (ground != mPaneGround) {
+            mPaneGround = ground;
+            if (mOnPaneGroundChanged != null) mOnPaneGroundChanged.run();
+        }
+        return resolution;
+    }
+
+    /**
+     * What the terminal's text stands on across the pane band: the mean of the panes' flat glass —
+     * wallpaper, the launcher's dim, each pane's tint — opaque. Read only, never samples: before
+     * any pane has been measured it is the ground {@link #seedPaneGround} carried over from the
+     * last run, and failing that the mode's nominal glass under {@code tint}, the same guess every
+     * band starts from. Independent of the palette, so a palette built on it cannot feed
+     * back into it.
+     *
+     * @param tint the pane's tint as drawn, alpha included, for the nominal answer
+     */
+    @ColorInt
+    public int terminalPaneGround(@ColorInt int tint) {
+        readMode();
+        if (Color.alpha(mPaneGround) != 0) return mPaneGround;
+        return OnGlass.backdrop(mCache.fallbackWallpaper(), mDimColor, tint);
+    }
+
+    /**
+     * The ground a previous run measured, answered by {@link #terminalPaneGround} until a pane is
+     * measured in this one, so a launch does not start from the nominal glass. Ignored once a pane
+     * has been measured, and for a transparent {@code ground}. Tells no listener: nothing was
+     * measured.
+     */
+    public void seedPaneGround(@ColorInt int ground) {
+        if (Color.alpha(mPaneGround) != 0 || Color.alpha(ground) == 0) return;
+        mPaneGround = OnGlass.opaque(ground);
+    }
+
+    /**
+     * Runs {@code listener} each time {@link #terminalPaneGround} moves — only when a pane is
+     * measured anew (a wallpaper, dim, tint or rect change), never for a memoised answer. It runs
+     * inside whatever pass asked about the pane, a draw included, so it must only post. Null
+     * removes it.
+     */
+    public void setOnTerminalPaneGroundChanged(@Nullable Runnable listener) {
+        mOnPaneGroundChanged = listener;
+    }
+
+    /** Terminal panes remembered right now, for tests. */
+    int paneAnswerCountForTests() {
+        return mPanes.size();
+    }
+
+    /**
+     * The pane band's one vote: the mean of its panes' flat glass, over the panes measured under
+     * {@code tint} and the dim as they are now. Every pane wears the one tint, and every dress
+     * pass re-asks each live pane, so an answer under another tint is a rect no pane is laid out
+     * at any more (the window before the keyboard rose, the editor opened, a split closed): kept
+     * for its sample, never counted. Counted, it held the ground on the glass as it was, and a
+     * terminal taken to a white opacity 100 kept the pale ink of the opacity 0 it came from.
+     */
+    @ColorInt
+    private int meanPaneVote(@ColorInt int tint) {
+        long red = 0, green = 0, blue = 0;
+        int count = 0;
+        for (PaneAnswer pane : mPanes.values()) {
+            if (pane.tint != tint || pane.dim != mDimColor) continue;
+            red += Color.red(pane.flat);
+            green += Color.green(pane.flat);
+            blue += Color.blue(pane.flat);
+            count++;
+        }
+        count = Math.max(1, count);
+        return Color.rgb((int) (red / count), (int) (green / count), (int) (blue / count));
+    }
+
+    /** The user's legibility control as this answers by it. */
+    @NonNull
+    public LegibilityLevel legibility() {
+        readMode();
+        return mLevel;
+    }
+
+    /**
+     * {@code tier} at the user's legibility level: what a band asking at that tier is really held
+     * to. For a caller that measures something on a band itself and must promise what the band
+     * promises.
+     */
+    public double target(double tier) {
+        readMode();
+        return mLevel.target(tier);
+    }
+
+    /**
+     * What {@code band} is drawn on before its own glass, from a screen rect — the one-call read
+     * for a band with no glass of its own (the A&ndash;Z strip). Mapped into root space exactly as
+     * {@link #onGlass} maps it, so the two share one sample instead of taking turns.
+     *
+     * @see GlassBackdropCache#backdropUnder
+     */
+    @ColorInt
+    public int backdropUnder(@NonNull GlassBackdropCache.Band band, @NonNull Rect screenRect,
+                             @ColorInt int dim, @ColorInt int glassTint) {
+        readMode();
+        toRootSpace(screenRect, mTmpRootRect);
+        return mCache.backdropUnder(band, mTmpRootRect, dim, glassTint);
     }
 
     /**
@@ -202,6 +616,16 @@ public final class ChromeInk {
      * toned on the surface that is really under it and not on the veil it would have bought
      * alone.</p>
      */
+    /**
+     * The most veil a surface may buy: none (2026-10-10). Every surface, the terminal included, is
+     * exactly the glass its Look and sliders say, so the terminal never stands darker than the
+     * keyboard; legibility is the ink's job (its polarity here, the terminal palette's Contrast
+     * level for the panes), and a user who wants a darker ground raises Darkness.
+     */
+    static int veilCeiling255(@ColorInt int tint) {
+        return 0;
+    }
+
     @NonNull
     private OnGlass.Resolution resolveBand(@NonNull GlassBackdropCache.Band band,
                                            @NonNull Contract contract) {
@@ -236,18 +660,23 @@ public final class ChromeInk {
     private OnGlass.Resolution resolveAt(@NonNull GlassBackdropCache.Band band,
                                          @NonNull Contract contract, int floorAlpha) {
         Rect screenRect = contract.rect;
-        double target = contract.target;
+        double target = mLevel.target(contract.target);
+        if (contract.fixedInk) return resolveFixedAt(band, contract, target);
         BandGlass glass = glassFor(band);
         int baseAlpha = ChromePolicy.dockGlassBaseAlpha(glass.opacity);
-        // The band's flat glass: wallpaper, the launcher's dim, the base layer. No light model, so
-        // the polarity vote is the same number whichever ink is asking.
-        int wallpaper = mCache.wallpaperUnder(band, screenRect);
-        int flat = OnGlass.backdrop(wallpaper, mDimColor, OnGlass.withAlpha(mBaseColor, baseAlpha));
-        vote(band, flat);
+        // The colour the base layer is really drawn in: the tint the surface told, accent and all,
+        // so no Tint amount can carry a band past the promise unmeasured.
+        int baseColor = baseOf(glass);
         // What the band's own glass is laid on, and nothing of the glass itself: the base layer is
         // part of the tint that gets composited over this, so counting it here too would apply it
         // twice and pick the worst row off a band a shade lighter than the one being drawn.
+        int wallpaper = mCache.wallpaperUnder(band, screenRect);
         int under = OnGlass.backdrop(wallpaper, mDimColor, Color.TRANSPARENT);
+        // The band's flat glass: wallpaper, the launcher's dim, the base layer in its tinted
+        // colour. No light model, so the polarity vote is the same number whichever ink is
+        // asking.
+        int flat = OnGlass.composite(OnGlass.withAlpha(baseColor, baseAlpha), under);
+        vote(band, flat);
         int ink = polarity() == Polarity.DARK_INK ? contract.darkInk : contract.paleInk;
 
         int top = DockGlassRendering.topSheenAlpha(glass.opacity);
@@ -263,19 +692,155 @@ public final class ChromeInk {
         // the row is re-checked against the ink that came back, and a second pass settles it: that
         // pass measures at the resolved ink's own worst row, and a dark ink's worst row is the
         // foot, which is the extreme of the model.
-        float worst = DockGlassRendering.worstLightModelStop(ink, under, mBaseColor, baseAlpha,
+        float worst = DockGlassRendering.worstLightModelStop(ink, under, baseColor, baseAlpha,
             mAccentColor, top, mid, foot, glass.sliceStart, glass.sliceEnd);
-        OnGlass.Resolution resolved = resolveAtStop(band, screenRect, worst, under, mBaseColor,
+        OnGlass.Resolution resolved = resolveAtStop(band, screenRect, worst, under, baseColor,
             baseAlpha, top, mid, foot, ink, target, floorAlpha);
         for (int pass = 0; pass < 2; pass++) {
-            float again = DockGlassRendering.worstLightModelStop(resolved.ink, under, mBaseColor,
+            float again = DockGlassRendering.worstLightModelStop(resolved.ink, under, baseColor,
                 baseAlpha, mAccentColor, top, mid, foot, glass.sliceStart, glass.sliceEnd);
             if (again == worst) break;
             worst = again;
-            resolved = resolveAtStop(band, screenRect, worst, under, mBaseColor, baseAlpha, top,
+            resolved = resolveAtStop(band, screenRect, worst, under, baseColor, baseAlpha, top,
                 mid, foot, ink, target, floorAlpha);
         }
         return resolved;
+    }
+
+    /**
+     * A fixed-ink band ({@link #onFixedInk}) measured on its own glass at the row where the model
+     * works hardest against its ink, and veiled toward its own base colour until the ink clears
+     * {@code target} on the cap over that. Nothing shares such a pane, so there is no floor, and
+     * the ink never moves, so there is no second pass: the row is the ink's own worst.
+     */
+    @NonNull
+    private OnGlass.Resolution resolveFixedAt(@NonNull GlassBackdropCache.Band band,
+                                              @NonNull Contract contract, double target) {
+        BandGlass glass = glassFor(band);
+        int baseAlpha = ChromePolicy.dockGlassBaseAlpha(glass.opacity);
+        int baseColor = baseOf(glass);
+        int wallpaper = mCache.wallpaperUnder(band, contract.rect);
+        int under = OnGlass.backdrop(wallpaper, mDimColor, Color.TRANSPARENT);
+        vote(band, OnGlass.composite(OnGlass.withAlpha(baseColor, baseAlpha), under));
+        int top = DockGlassRendering.topSheenAlpha(glass.opacity);
+        int mid = DockGlassRendering.midSheenAlpha(glass.opacity);
+        int foot = DockGlassRendering.footAlpha(glass.opacity, glass.withFoot);
+        // Measured row by row, not on the band's mean: a keyboard's bottom row can stand on
+        // wallpaper far darker (or paler) than the band's average, and a promise made on the mean
+        // is broken there. The veil is bought on the row where the ink reads worst on its cap.
+        int[] rows = rowWallpapers(band, contract.rect);
+        boolean ownCaps = contract.secondCap != contract.cap;
+        int ink = contract.darkInk;
+        int secondInk = contract.secondInk;
+        if (contract.eitherTone) {
+            // The tone is the bare face's choice, never the legends drawn last: the margin each
+            // pair reaches there, letter and second legend together, with no veil at all.
+            double dark = bareMargin(glass, rows, contract.darkInk, contract.secondInk, contract,
+                ownCaps, baseColor, baseAlpha, top, mid, foot, target);
+            double pale = bareMargin(glass, rows, contract.paleInk, contract.secondPaleInk,
+                contract, ownCaps, baseColor, baseAlpha, top, mid, foot, target);
+            contract.tone = chooseTone(contract.tone, dark, pale);
+            if (contract.tone == TONE_PALE) {
+                ink = contract.paleInk;
+                secondInk = contract.secondPaleInk;
+            }
+        }
+        int backdrop = worstRowSurface(glass, rows, ink, contract.cap, baseColor,
+            baseAlpha, top, mid, foot);
+        int secondBackdrop = ownCaps ? worstRowSurface(glass, rows, secondInk,
+            contract.secondCap, baseColor, baseAlpha, top, mid, foot) : backdrop;
+        OnGlass.Resolution known = contract.fixedAnswer;
+        if (known != null && contract.fixedBackdrop == backdrop
+                && contract.fixedSecondBackdrop == secondBackdrop
+                && contract.fixedVeilColor == baseColor && contract.fixedCap == contract.cap
+                && contract.fixedSecondCap == contract.secondCap
+                && contract.fixedInkAsked == ink
+                && contract.fixedSecondInkAsked == secondInk
+                && Double.compare(contract.fixedTarget, target) == 0) {
+            return known;
+        }
+        OnGlass.Resolution resolved;
+        if (!ownCaps) {
+            resolved = OnGlass.resolveFixedInk(backdrop, contract.cap, ink,
+                secondInk, baseColor, target);
+        } else {
+            OnGlass.Resolution first = OnGlass.resolveFixedInk(backdrop, contract.cap,
+                ink, ink, baseColor, target);
+            OnGlass.Resolution second = OnGlass.resolveFixedInk(secondBackdrop,
+                contract.secondCap, secondInk, secondInk, baseColor, target);
+            // One veil for the band: the one the harder of the two legends needs.
+            resolved = Color.alpha(second.veil) > Color.alpha(first.veil) ? second : first;
+        }
+        contract.fixedAnswer = resolved;
+        contract.fixedBackdrop = backdrop;
+        contract.fixedSecondBackdrop = secondBackdrop;
+        contract.fixedVeilColor = baseColor;
+        contract.fixedCap = contract.cap;
+        contract.fixedSecondCap = contract.secondCap;
+        contract.fixedInkAsked = ink;
+        contract.fixedSecondInkAsked = secondInk;
+        contract.fixedTarget = target;
+        return resolved;
+    }
+
+    /**
+     * The lower of the two legends' margins (contrast over {@code target}) on the bare face: each
+     * on its cap over the row where it reads worst, no veil. 1 or more clears both.
+     */
+    private double bareMargin(@NonNull BandGlass glass, @NonNull int[] rows, @ColorInt int ink,
+                              @ColorInt int secondInk, @NonNull Contract contract,
+                              boolean ownCaps, @ColorInt int baseColor, int baseAlpha, int top,
+                              int mid, int foot, double target) {
+        int backdrop = worstRowSurface(glass, rows, ink, contract.cap, baseColor, baseAlpha, top,
+            mid, foot);
+        int secondBackdrop = ownCaps ? worstRowSurface(glass, rows, secondInk, contract.secondCap,
+            baseColor, baseAlpha, top, mid, foot) : backdrop;
+        double first = OnGlass.ratio(ink, OnGlass.opaque(OnGlass.composite(contract.cap, backdrop)));
+        double second = OnGlass.ratio(secondInk,
+            OnGlass.opaque(OnGlass.composite(contract.secondCap, secondBackdrop)));
+        return Math.min(first, second) / target;
+    }
+
+    /**
+     * The tone for bare margins {@code dark} and {@code pale}: the one that clears the floor (1),
+     * else the one with the larger margin when both or neither do. A band that has chosen
+     * ({@code previous}) keeps its tone unless the other's margin is more than
+     * {@link #TONE_HYSTERESIS} times its own.
+     */
+    static int chooseTone(int previous, double dark, double pale) {
+        int fresh;
+        if ((dark >= 1d) != (pale >= 1d)) fresh = dark >= 1d ? TONE_DARK : TONE_PALE;
+        else fresh = pale > dark ? TONE_PALE : TONE_DARK;
+        if (previous == 0 || previous == fresh) return fresh;
+        double kept = previous == TONE_DARK ? dark : pale;
+        double other = previous == TONE_DARK ? pale : dark;
+        return other > kept * TONE_HYSTERESIS ? fresh : previous;
+    }
+
+    /**
+     * The glass surface under the row of {@code rows} (and the light model's stop within it) where
+     * {@code ink} reads worst on {@code cap}: the row a fixed ink's promise has to be made at.
+     */
+    @ColorInt
+    private int worstRowSurface(@NonNull BandGlass glass, @NonNull int[] rows, @ColorInt int ink,
+                                @ColorInt int cap, @ColorInt int baseColor, int baseAlpha,
+                                int top, int mid, int foot) {
+        int worst = 0;
+        double worstRatio = Double.MAX_VALUE;
+        for (int i = 0; i < rows.length; i++) {
+            int rowUnder = OnGlass.backdrop(rows[i], mDimColor, Color.TRANSPARENT);
+            float stop = DockGlassRendering.worstLightModelStop(ink, rowUnder, baseColor,
+                baseAlpha, mAccentColor, top, mid, foot, rowPosition(glass, i),
+                rowPosition(glass, i + 1));
+            int surface = DockGlassRendering.glassSurfaceAt(stop, rowUnder, baseColor, baseAlpha,
+                mAccentColor, top, mid, foot);
+            double ratio = OnGlass.ratio(ink, OnGlass.opaque(OnGlass.composite(cap, surface)));
+            if (ratio < worstRatio) {
+                worstRatio = ratio;
+                worst = surface;
+            }
+        }
+        return worst;
     }
 
     /**
@@ -302,7 +867,8 @@ public final class ChromeInk {
         boolean pale = polarity() == Polarity.PALE_INK;
         if (OnGlass.ratio(ink, OnGlass.opaque(baseColor)) > OnGlass.ratio(ink, backdrop)) {
             OnGlass.Resolution own =
-                mCache.resolveOn(band, screenRect, backdrop, ink, ink, baseColor, target, pale);
+                mCache.resolveOn(band, screenRect, backdrop, ink, ink, baseColor, target, pale,
+                    veilCeiling255(OnGlass.withAlpha(baseColor, baseAlpha)));
             if (Color.alpha(own.veil) >= floorAlpha) return own;
             return OnGlass.resolveUnder(backdrop, OnGlass.withAlpha(baseColor, floorAlpha), ink,
                 target, pale);
@@ -351,11 +917,63 @@ public final class ChromeInk {
     public int inkOn(@NonNull OnGlass.Resolution resolved, @ColorInt int ground,
                      @ColorInt int darkInk, @ColorInt int paleInk, double target) {
         boolean pale = polarity() == Polarity.PALE_INK;
-        int ink = pale ? paleInk : darkInk;
+        // Asked in the Default level's tiers like every band, held to the user's level.
+        target = mLevel.target(target);
         int opaqueGround = OnGlass.opaque(ground);
-        int directed = OnGlass.inkOnBand(resolved, opaqueGround, ink, ink, target, pale);
-        if (OnGlass.ratio(directed, opaqueGround) >= target) return directed;
-        return OnGlass.inkOnBand(resolved, opaqueGround, darkInk, paleInk, target, null);
+        // The answer is a function of these five and nothing else, and every chrome pass asks the
+        // same questions again for every widget on the bar: remember them rather than re-walk the
+        // tones. The polarity is part of the question, so nothing here can go stale.
+        InkQuestion question = new InkQuestion(pale, opaqueGround, darkInk, paleInk, target);
+        Integer known = mInkAnswers.get(question);
+        if (known != null) return known;
+        int ink = pale ? paleInk : darkInk;
+        int answer = OnGlass.inkOnBand(resolved, opaqueGround, ink, ink, target, pale);
+        if (OnGlass.ratio(answer, opaqueGround) < target)
+            answer = OnGlass.inkOnBand(resolved, opaqueGround, darkInk, paleInk, target, null);
+        if (mInkAnswers.size() >= MAX_INK_ANSWERS) mInkAnswers.clear();
+        mInkAnswers.put(question, answer);
+        return answer;
+    }
+
+    /** A bar asks a few dozen distinct questions; a new wallpaper or palette asks a new set. */
+    static final int MAX_INK_ANSWERS = 64;
+    @NonNull private final java.util.Map<InkQuestion, Integer> mInkAnswers = new java.util.HashMap<>();
+
+    /** Number of remembered answers, for tests. */
+    int inkAnswerCountForTests() {
+        return mInkAnswers.size();
+    }
+
+    /** Everything {@link #inkOn(OnGlass.Resolution, int, int, int, double)} answers from. */
+    private static final class InkQuestion {
+        final boolean pale;
+        final int ground;
+        final int darkInk;
+        final int paleInk;
+        final long target;
+
+        InkQuestion(boolean pale, int ground, int darkInk, int paleInk, double target) {
+            this.pale = pale;
+            this.ground = ground;
+            this.darkInk = darkInk;
+            this.paleInk = paleInk;
+            this.target = Double.doubleToLongBits(target);
+        }
+
+        @Override public boolean equals(Object other) {
+            if (!(other instanceof InkQuestion)) return false;
+            InkQuestion that = (InkQuestion) other;
+            return pale == that.pale && ground == that.ground && darkInk == that.darkInk
+                && paleInk == that.paleInk && target == that.target;
+        }
+
+        @Override public int hashCode() {
+            int hash = pale ? 1 : 0;
+            hash = hash * 31 + ground;
+            hash = hash * 31 + darkInk;
+            hash = hash * 31 + paleInk;
+            return hash * 31 + Long.hashCode(target);
+        }
     }
 
     /**
@@ -415,6 +1033,241 @@ public final class ChromeInk {
         glass.withFoot = withFoot;
         glass.sliceStart = sliceStart;
         glass.sliceEnd = sliceEnd;
+        glass.tinted = false;
+    }
+
+    /**
+     * {@link #noteBandGlass(GlassBackdropCache.Band, float, boolean, float, float)} with the colour
+     * the band's base layer is really drawn in ({@code baseColor}, the tinted one; its alpha is
+     * ignored, the opacity says it). It is an input of every answer's search, so the next ask
+     * measures what is now drawn.
+     *
+     * @return whether the band's face moved: its opacity or tinted base differ from what was told
+     *     before
+     */
+    boolean noteBandGlass(@NonNull GlassBackdropCache.Band band, float opacity, boolean withFoot,
+                          float sliceStart, float sliceEnd, @ColorInt int baseColor) {
+        BandGlass glass = glassFor(band);
+        float opacityBefore = glass.opacity;
+        boolean tintedBefore = glass.tinted;
+        int baseBefore = glass.baseColor;
+        noteBandGlass(band, opacity, withFoot, sliceStart, sliceEnd);
+        glass.tinted = true;
+        glass.baseColor = baseColor;
+        return !tintedBefore || Float.compare(opacityBefore, glass.opacity) != 0
+            || baseBefore != baseColor;
+    }
+
+    /**
+     * The blur {@code band}'s glass is drawn at, in dp: its rows ({@link #bandFaces}, the fixed-ink
+     * veil) are then read off the wallpaper as blurred at that radius, the frame that band really
+     * shows, rather than the status bar's or the dock's. The keyboard is the case: Look › Custom
+     * gives it a Glass of its own, and at 20 (7 dp) its bottom row stood on near-black grass while
+     * the dock's 25 dp frame, which the rows were read off, had blurred the bright grass above
+     * into it, so its legends were chosen dark on a face the screen never showed. Arithmetic
+     * only; the frame is the one the band draws, already resident.
+     *
+     * @return whether the radius moved
+     */
+    public boolean noteBandBlur(@NonNull GlassBackdropCache.Band band, int blurRadiusDp) {
+        BandGlass glass = glassFor(band);
+        int radius = Math.max(-1, blurRadiusDp);
+        if (glass.blurRadiusDp == radius) return false;
+        glass.blurRadiusDp = radius;
+        return true;
+    }
+
+    /**
+     * The opaque face {@code band}'s content stands on, under {@code screenRect}: the wallpaper,
+     * the launcher's dim, and the band's base layer in its tinted colour at its opacity
+     * ({@link #noteBandGlass}). The same flat glass the band votes with; no light model, so it is
+     * one colour whichever ink asks. For content whose ink is chosen on its own face rather than
+     * through {@link #onGlass}: the extra keys. Asks nothing and votes nothing.
+     */
+    @ColorInt
+    public int faceUnder(@NonNull GlassBackdropCache.Band band, @NonNull Rect screenRect) {
+        readMode();
+        toRootSpace(screenRect, mTmpRootRect);
+        return flatFace(band, mTmpRootRect);
+    }
+
+    /**
+     * {@link #faceUnder} at the rect the band's content last asked about ({@link #onGlass},
+     * {@link #onFixedInk}); {@link Color#TRANSPARENT} before it has asked. The keyboard's caps
+     * stand on this.
+     */
+    @ColorInt
+    public int bandFace(@NonNull GlassBackdropCache.Band band) {
+        readMode();
+        Contract contract = mContracts.get(band);
+        if (contract == null || !contract.seen) return Color.TRANSPARENT;
+        return flatFace(band, contract.rect);
+    }
+
+    /**
+     * Horizontal rows a fixed-ink band's face is measured in, top to bottom. A keyboard's rows of
+     * keys stand on different wallpaper (bright grass under the top row, near-black blades under
+     * Ctrl and Alt), and one mean over the whole band passes a legend that the bottom row then
+     * cannot show.
+     */
+    public static final int FACE_ROWS = 4;
+
+    /** One band's wallpaper per row, kept for its rect, its blur and the cache's generation. */
+    private static final class RowSamples {
+        @NonNull final Rect rect = new Rect();
+        @NonNull final int[] wallpaper = new int[FACE_ROWS];
+        int generation = -1;
+        int blurRadiusDp = -1;
+        boolean sampled;
+        /**
+         * The band noted a radius ({@link #noteBandBlur}) whose frame was not resident, so its
+         * rows were read off another frame (a stand-in): {@link #onBlurFrameReady} names the band
+         * once that frame lands.
+         */
+        boolean standIn;
+        /** {@link #onBlurFrameReady} has named the band for this stand-in reading already. */
+        boolean reported;
+    }
+
+    @NonNull private final Map<GlassBackdropCache.Band, RowSamples> mRows =
+        new EnumMap<>(GlassBackdropCache.Band.class);
+    @NonNull private final Rect mTmpRowRect = new Rect();
+
+    /**
+     * A pre-blurred frame has landed ({@link WallpaperBlurCache}'s frame-ready, or a held drag's
+     * release). The bands whose rows ({@link #bandFaces}, the fixed-ink veil) were read off a
+     * stand-in for want of the frame they noted, and whose frame is now readable: their rows are
+     * read again on the next ask, so the caller re-pushes what it chose from them (the keyboard's
+     * legends). A Glass edit is the case: the keyboard asks for a radius nothing has baked, its
+     * rows are read off the dock's frame meanwhile, and nothing else would re-judge its legends
+     * once its own frame is there.
+     *
+     * <p>Each stand-in reading is named once: a band named here is not named again until its rows
+     * have been read afresh and fallen back once more. One probe per such band; nothing per frame
+     * and nothing asked of the blur cache, so a re-dress this starts cannot bring itself back.</p>
+     *
+     * @return the bands to re-judge; empty for none
+     */
+    @NonNull
+    public java.util.Set<GlassBackdropCache.Band> onBlurFrameReady() {
+        java.util.Set<GlassBackdropCache.Band> due =
+            java.util.EnumSet.noneOf(GlassBackdropCache.Band.class);
+        for (Map.Entry<GlassBackdropCache.Band, RowSamples> entry : mRows.entrySet()) {
+            RowSamples rows = entry.getValue();
+            if (!rows.standIn || rows.reported || rows.blurRadiusDp < 0 || rows.rect.isEmpty())
+                continue;
+            if (glassFor(entry.getKey()).blurRadiusDp != rows.blurRadiusDp) continue;
+            if (Color.alpha(mCache.sampleUncached(rows.rect, rows.blurRadiusDp)) == 0) continue;
+            rows.reported = true;
+            due.add(entry.getKey());
+        }
+        return due;
+    }
+
+    /**
+     * The legend tone {@code band} chose on its bare face ({@link #onFixedInkEitherTone}):
+     * {@link #TONE_DARK} or {@link #TONE_PALE}, or 0 before it has asked that way. Read after
+     * {@link #bandFaces}, which settles it for the faces it returns.
+     */
+    public int bandTone(@NonNull GlassBackdropCache.Band band) {
+        Contract contract = mContracts.get(band);
+        return contract == null || !contract.eitherTone ? 0 : contract.tone;
+    }
+
+    /**
+     * The opaque face under each of {@link #FACE_ROWS} rows of {@code band}, top to bottom, at the
+     * rect its content last asked about ({@link #onFixedInk}): the wallpaper under that row, the
+     * launcher's dim, the base layer in its tinted colour at its opacity, the light
+     * model at that row, and the veil the band is drawn with over all of it. The keyboard's legends
+     * are chosen so they read on every one. Empty before the band has asked. Sampled once per rect
+     * and wallpaper generation; the rest is arithmetic on a dress pass, never per frame.
+     */
+    @NonNull
+    public int[] bandFaces(@NonNull GlassBackdropCache.Band band) {
+        readMode();
+        Contract contract = mContracts.get(band);
+        if (contract == null || !contract.seen) return new int[0];
+        int veil = resolveBand(band, contract).veil;
+        BandGlass glass = glassFor(band);
+        int baseAlpha = ChromePolicy.dockGlassBaseAlpha(glass.opacity);
+        int baseColor = baseOf(glass);
+        int top = DockGlassRendering.topSheenAlpha(glass.opacity);
+        int mid = DockGlassRendering.midSheenAlpha(glass.opacity);
+        int foot = DockGlassRendering.footAlpha(glass.opacity, glass.withFoot);
+        int[] rows = rowWallpapers(band, contract.rect);
+        int[] faces = new int[rows.length];
+        for (int i = 0; i < rows.length; i++) {
+            int under = OnGlass.backdrop(rows[i], mDimColor, Color.TRANSPARENT);
+            float centre = (rowPosition(glass, i) + rowPosition(glass, i + 1)) / 2f;
+            int surface = DockGlassRendering.glassSurfaceAt(centre, under, baseColor, baseAlpha,
+                mAccentColor, top, mid, foot);
+            faces[i] = OnGlass.opaque(OnGlass.composite(veil, surface));
+        }
+        return faces;
+    }
+
+    /** Where row edge {@code edge} (0 to {@link #FACE_ROWS}) falls in the band's model slice. */
+    private static float rowPosition(@NonNull BandGlass glass, int edge) {
+        return glass.sliceStart + (glass.sliceEnd - glass.sliceStart) * edge / (float) FACE_ROWS;
+    }
+
+    /**
+     * The wallpaper under each row of {@code rootRect}, remembered per band for that rect and the
+     * cache's generation. A row that cannot be read yet stands in with the band's whole sample and
+     * is asked again next time, as the band's own sample heals.
+     */
+    @NonNull
+    private int[] rowWallpapers(@NonNull GlassBackdropCache.Band band, @NonNull Rect rootRect) {
+        RowSamples rows = mRows.get(band);
+        if (rows == null) {
+            rows = new RowSamples();
+            mRows.put(band, rows);
+        }
+        // Read off the frame the band is drawn at (noteBandBlur) where it said; until that frame
+        // is resident, off the default one, and asked again next time.
+        int radius = glassFor(band).blurRadiusDp;
+        if (rows.sampled && rows.generation == mCache.generation() && rows.rect.equals(rootRect)
+                && rows.blurRadiusDp == radius)
+            return rows.wallpaper;
+        int whole = mCache.wallpaperUnder(band, rootRect);
+        boolean all = mCache.hasSample(band);
+        boolean standIn = false;
+        int height = rootRect.height();
+        for (int i = 0; i < FACE_ROWS; i++) {
+            mTmpRowRect.set(rootRect.left, rootRect.top + height * i / FACE_ROWS,
+                rootRect.right, rootRect.top + height * (i + 1) / FACE_ROWS);
+            int read = radius >= 0 ? mCache.sampleUncached(mTmpRowRect, radius)
+                : GlassBackdropCache.UNREADABLE;
+            if (radius >= 0 && Color.alpha(read) == 0) {
+                all = false;
+                standIn = true;
+                read = mCache.sampleUncached(mTmpRowRect);
+            } else if (radius < 0) {
+                read = mCache.sampleUncached(mTmpRowRect);
+            }
+            if (Color.alpha(read) == 0) {
+                rows.wallpaper[i] = whole;
+                all = false;
+            } else {
+                rows.wallpaper[i] = read;
+            }
+        }
+        rows.rect.set(rootRect);
+        rows.generation = mCache.generation();
+        rows.blurRadiusDp = radius;
+        rows.sampled = all;
+        rows.standIn = standIn;
+        rows.reported = false;
+        return rows.wallpaper;
+    }
+
+    /** {@link #faceUnder} for a rect already in root space. */
+    @ColorInt
+    private int flatFace(@NonNull GlassBackdropCache.Band band, @NonNull Rect rootRect) {
+        BandGlass glass = glassFor(band);
+        int under = OnGlass.backdrop(mCache.wallpaperUnder(band, rootRect), mDimColor, Color.TRANSPARENT);
+        return OnGlass.opaque(OnGlass.composite(OnGlass.withAlpha(baseOf(glass),
+            ChromePolicy.dockGlassBaseAlpha(glass.opacity)), under));
     }
 
     /**
@@ -491,6 +1344,59 @@ public final class ChromeInk {
             : band;
     }
 
+    // ------------------------------------------------------------------ root space
+
+    /**
+     * {@code screenRect} in the root container's untransformed space, written to {@code out}:
+     * where the band would be on screen if {@code terminal_root_container} carried no scale and no
+     * translation. That is the space the wallpaper frame is captured in and the wallpaper backdrop
+     * is laid out in, and the backdrop is inside the root, so a scaled root scales its wallpaper
+     * with it: the pixels under a band are the ones under its unscaled rect.
+     *
+     * <p>Identity — and free — while the root is untransformed, which is every moment outside the
+     * editor, and whenever the root cannot be found (before inflation, in a test). Rotation is not
+     * undone: nothing rotates the root.</p>
+     */
+    void toRootSpace(@NonNull Rect screenRect, @NonNull Rect out) {
+        View root = mSurfaces.findChromeView(R.id.terminal_root_container);
+        if (root == null || (root.getScaleX() == 1f && root.getScaleY() == 1f
+                && root.getTranslationX() == 0f && root.getTranslationY() == 0f)) {
+            out.set(screenRect);
+            return;
+        }
+        GlassAnchor.layoutOriginOnScreen(root, mTmpRootLocation, mTmpRootScratch);
+        mapIntoRoot(screenRect, mTmpRootLocation[0], mTmpRootLocation[1], root.getScaleX(),
+            root.getScaleY(), root.getPivotX(), root.getPivotY(), root.getTranslationX(),
+            root.getTranslationY(), out);
+    }
+
+    /**
+     * The arithmetic of {@link #toRootSpace}: undoes a view's scale about its pivot and its
+     * translation, for a rect measured on screen inside it.
+     *
+     * <p>A view at laid-out origin {@code O} on screen draws its own point {@code p} at
+     * {@code O + pivot + scale * (p - pivot) + translation}. Solving for {@code p} and adding
+     * {@code O} back gives the point where the same content sits with the transform gone. A zero
+     * scale draws nothing and maps nothing: the rect comes back as it went in.</p>
+     *
+     * @param originX the root's laid-out left edge on screen, transforms ignored
+     * @param originY its laid-out top edge
+     */
+    @VisibleForTesting
+    public static void mapIntoRoot(@NonNull Rect screenRect, float originX, float originY,
+                                   float scaleX, float scaleY, float pivotX, float pivotY,
+                                   float translationX, float translationY, @NonNull Rect out) {
+        if (scaleX == 0f || scaleY == 0f) {
+            out.set(screenRect);
+            return;
+        }
+        out.set(
+            Math.round(originX + pivotX + (screenRect.left - originX - translationX - pivotX) / scaleX),
+            Math.round(originY + pivotY + (screenRect.top - originY - translationY - pivotY) / scaleY),
+            Math.round(originX + pivotX + (screenRect.right - originX - translationX - pivotX) / scaleX),
+            Math.round(originY + pivotY + (screenRect.bottom - originY - translationY - pivotY) / scaleY));
+    }
+
     // ------------------------------------------------------------------ lifecycle
 
     /**
@@ -501,7 +1407,25 @@ public final class ChromeInk {
     public void invalidate() {
         mCache.invalidate();
         mVotes.clear();
-        for (Contract contract : mContracts.values()) contract.veil = Color.TRANSPARENT;
+        mPanes.clear();
+        for (Contract contract : mContracts.values()) {
+            contract.veil = Color.TRANSPARENT;
+            contract.fixedAnswer = null;
+        }
+    }
+
+    /**
+     * Forgets everything that was decided from the chrome as it stood, so the next pass decides
+     * from the chrome as it stands now, exactly as the first pass after a launch does. A Style
+     * change moves every band, and {@link #invalidate} alone deliberately keeps the polarity: its
+     * hysteresis would carry the Floating-era answer back into Docked, and a launch in Docked
+     * would not have made it.
+     */
+    public void resetForRedress() {
+        invalidate();
+        for (Contract contract : mContracts.values()) contract.tone = 0;
+        mPolarity = null;
+        mInkAnswers.clear();
     }
 
     /** The backing cache, for tests and for a caller that wants the raw backdrop. */
@@ -518,15 +1442,24 @@ public final class ChromeInk {
      * on every call, rather than left to callers: four phases wire views into this and a palette or
      * light/dark change that nobody remembered to report would show as stale ink for a whole
      * session. Three int comparisons is the price.
+     *
+     * <p>The legibility level is read here for the same reason. A new level asks every band for a
+     * new veil, and the targets it scales are part of every memo key, so the invalidate below is
+     * only there to drop the veils recorded against the old one.</p>
      */
     private void readMode() {
         int base = mSurfaces.glassBaseColor();
         int accent = mSurfaces.accentColor();
         int dim = mSurfaces.wallpaperDimColor();
-        if (mModeRead && base == mBaseColor && accent == mAccentColor && dim == mDimColor) return;
+        LegibilityLevel level = mSurfaces.legibilityLevel();
+        if (mModeRead && base == mBaseColor && accent == mAccentColor && dim == mDimColor
+                && level == mLevel) {
+            return;
+        }
         mBaseColor = base;
         mAccentColor = accent;
         mDimColor = dim;
+        mLevel = level;
         mModeRead = true;
         // Before anything is measured a band is answered with the mode's nominal glass, which is
         // exactly what the app drew before this round: no flash, and no crash.
@@ -604,11 +1537,15 @@ public final class ChromeInk {
      *       device's own mid-dark glass the filter darkens by a few RGB units, so an unmodelled
      *       sample would report the band as lighter than the user sees it.</li>
      * </ul>
+     *
+     * <p>{@code screenRect} arrives in root space ({@link #toRootSpace}), which is the space the
+     * frame rect is captured in, so the crop below is the same with the root scaled or not.</p>
      */
     @ColorInt
-    private int sampleWallpaper(@NonNull Rect screenRect) {
+    private int sampleWallpaper(@NonNull Rect screenRect, int blurRadiusDp) {
         try {
-            Bitmap frame = residentFrame();
+            Bitmap frame = blurRadiusDp == DEFAULT_FRAME ? residentFrame()
+                : residentFrame(blurRadiusDp);
             if (frame == null || frame.isRecycled()) return GlassBackdropCache.UNREADABLE;
             Rect frameRect = mBlurCache.frameRectRef();
             if (frameRect.isEmpty()) return GlassBackdropCache.UNREADABLE;
@@ -635,6 +1572,19 @@ public final class ChromeInk {
      * A pre-blurred frame already in the cache, or null. Never asks for one that is not resident:
      * a sample is worth no decode, and the band self-heals.
      */
+    /** {@link #sampleWallpaper(Rect, int)}'s radius for the default frame ({@link #residentFrame()}). */
+    private static final int DEFAULT_FRAME = -1;
+
+    /** The frame blurred at {@code blurRadiusDp} if it is resident, or null; never asks for one. */
+    @Nullable
+    private Bitmap residentFrame(int blurRadiusDp) {
+        if (blurRadiusDp < 0 || !mBlurCache.hasRadius(blurRadiusDp)) return null;
+        View wallpaperFrame = mSurfaces.findChromeView(R.id.activity_termux_root_view);
+        if (wallpaperFrame == null) return null;
+        return mBlurCache.obtain(blurRadiusDp, wallpaperFrame);
+    }
+
+    /** {@link #residentFrame(int)} at the status bar's radius, else the dock's, else the sharp frame. */
     @Nullable
     private Bitmap residentFrame() {
         View wallpaperFrame = mSurfaces.findChromeView(R.id.activity_termux_root_view);

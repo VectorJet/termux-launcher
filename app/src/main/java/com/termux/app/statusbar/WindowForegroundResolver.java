@@ -327,6 +327,7 @@ public final class WindowForegroundResolver {
         if (process.isEmpty()) return null;
         process = process.toLowerCase(Locale.ROOT);
         String wrapped = unwrapInterpreter(process, argv);
+        if (wrapped == null) wrapped = unwrapLane(process, argv);
         if (wrapped != null) process = wrapped;
         String openFile = null;
         if (TerminalWindowBar.isEditor(process)) {
@@ -406,10 +407,13 @@ public final class WindowForegroundResolver {
      * rewrites argv to put the interpreter first, so {@code codex} (a {@code #!/usr/bin/env node}
      * script) reports as plain {@code node} — same pill, same icon, for every such tool. Shells are
      * deliberately excluded: their own glyph already names them, and a shell's argv is at least as
-     * often {@code -c "..."} as a script path.
+     * often {@code -c "..."} as a script path. Electron counts too: an app run on a shared Electron
+     * (tlstore's terminal-browser execs Termux's {@code electron} with its own
+     * {@code terminal-browser/cli/dist/main.js}) is named by its script, not by the runtime.
      */
     private static final Set<String> INTERPRETERS = new HashSet<>(Arrays.asList(
-        "node", "nodejs", "bun", "deno", "python", "python3", "python2", "ruby", "perl", "php"));
+        "node", "nodejs", "bun", "deno", "python", "python3", "python2", "ruby", "perl", "php",
+        "electron"));
 
     /**
      * The one interpreter flag confidently parseable without knowing the rest of the command line:
@@ -441,6 +445,18 @@ public final class WindowForegroundResolver {
      * out rather than guessing: an eval flag's value is code, not a name, and an argument after an
      * unrecognized flag could just as easily be that flag's own value as a script path.
      */
+    /**
+     * The tool a privileged-lane client is running: {@code tl-priv run <path> [args]} relays a
+     * catalog binary that runs as shell, so the chip should name {@code btop}, not the relay.
+     */
+    @Nullable
+    @VisibleForTesting
+    static String unwrapLane(@NonNull String process, @NonNull String[] argv) {
+        if (!process.equals("tl-priv") || argv.length < 3 || !argv[1].equals("run")) return null;
+        String name = basename(argv[2]).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9._+-]", "");
+        return name.isEmpty() ? null : name;
+    }
+
     @Nullable
     @VisibleForTesting
     static String unwrapInterpreter(@NonNull String interpreter, @NonNull String[] argv) {

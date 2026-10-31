@@ -30,6 +30,29 @@ public final class TaiModelImporter {
     public static final String ERROR_NATIVE_LIBRARY_FORBIDDEN = "native_library_forbidden";
     public static final String ERROR_INSECURE_URL = "insecure_url";
     public static final String ERROR_UNSUPPORTED_BACKEND = "unsupported_backend";
+    /** {@code reason} on a {@code model_import_failed} result whose copy the caller cancelled. */
+    public static final String REASON_CANCELLED = "cancelled";
+    /** {@code reason} on a {@code model_import_failed} result whose file failed the readability sniff. */
+    public static final String REASON_UNREADABLE = "unreadable_model_file";
+
+    /**
+     * Hears the copy loop advance, about once per megabyte. {@code totalBytes} is {@code -1} when
+     * the source did not report a size. Returning {@code false} cancels the import; the partial file
+     * is removed and the result carries {@link #REASON_CANCELLED}.
+     */
+    public interface ProgressListener {
+        boolean onProgress(long copiedBytes, long totalBytes);
+    }
+
+    /** A failure the importer can name for callers without changing the result's error code. */
+    private static final class ImportFailure extends IllegalStateException {
+        final String reason;
+
+        ImportFailure(@NonNull String reason, @NonNull String message) {
+            super(message);
+            this.reason = reason;
+        }
+    }
 
     private final Context appContext;
     private final TaiModelStore store;
@@ -62,6 +85,20 @@ public final class TaiModelImporter {
                                      @Nullable String backend,
                                      @Nullable Set<String> declaredCapabilities,
                                      @Nullable TaiModelProfile requestedProfile) throws JSONException {
+        return importDocument(uri, requestedModelId, backend, declaredCapabilities, requestedProfile, null, null);
+    }
+
+    /**
+     * As the shorter overloads, with the name the model is shown under (the file name without its
+     * extension when null or blank) and a listener for the copy's progress.
+     */
+    @NonNull
+    public JSONObject importDocument(@NonNull Uri uri, @Nullable String requestedModelId,
+                                     @Nullable String backend,
+                                     @Nullable Set<String> declaredCapabilities,
+                                     @Nullable TaiModelProfile requestedProfile,
+                                     @Nullable String requestedDisplayName,
+                                     @Nullable ProgressListener listener) throws JSONException {
         DocumentMetadata metadata = readMetadata(uri);
         String fileName = sanitizeFileName(metadata.displayName);
         ValidationResult fileValidation = backend == null || backend.trim().isEmpty()
@@ -84,16 +121,20 @@ public final class TaiModelImporter {
             return error(500, "model_directory_failed", "Could not create the app-private model directory.");
         }
         if (metadata.sizeBytes > 0L && modelDir.getUsableSpace() < metadata.sizeBytes) {
+            long freeBytes = modelDir.getUsableSpace();
             deleteEmptyDirectory(modelDir);
-            return error(507, "insufficient_storage", "Not enough free storage to import this model.");
+            JSONObject full = error(507, "insufficient_storage", "Not enough free storage to import this model.");
+            full.put("neededBytes", metadata.sizeBytes);
+            full.put("freeBytes", freeBytes);
+            return full;
         }
 
         File output = new File(modelDir, fileName);
         File temporary = new File(modelDir, fileName + ".importing");
         try {
-            copyDocument(uri, temporary);
+            copyDocument(uri, temporary, metadata.sizeBytes, listener, null);
             if (!looksLikeModelFile(temporary, fileName)) {
-                throw new IllegalStateException("The selected file does not look like a readable model package.");
+                throw new ImportFailure(REASON_UNREADABLE, "The selected file does not look like a readable model package.");
             }
             if (output.exists() && !output.delete()) {
                 throw new IllegalStateException("Could not replace the existing destination file.");
@@ -102,7 +143,8 @@ public final class TaiModelImporter {
                 throw new IllegalStateException("Could not finalize the imported model file.");
             }
 
-            String displayName = stripModelExtension(metadata.displayName);
+            String displayName = requestedDisplayName == null || requestedDisplayName.trim().isEmpty()
+                ? stripModelExtension(metadata.displayName) : requestedDisplayName.trim();
             TaiModelSpec baseSpec = new TaiModelSpec(
                 modelId,
                 displayName.isEmpty() ? modelId : displayName,
@@ -151,12 +193,23 @@ public final class TaiModelImporter {
         } catch (Exception e) {
             temporary.delete();
             if (!output.exists()) deleteEmptyDirectory(modelDir);
-            return error(500, "model_import_failed", messageOrFallback(e, "Model import failed."));
+            return failed(e);
         }
     }
 
     /** Copy a selected MNN package into a private staging directory before making it visible. */
     public JSONObject importMnnDirectory(Uri tree, String requestedId, Set<String> declared) throws JSONException {
+        return importMnnDirectory(tree, requestedId, declared, null, null);
+    }
+
+    /**
+     * As {@link #importMnnDirectory(Uri, String, Set)}, with the name the model is shown under (the
+     * id when null or blank) and a listener for the copy's progress. The total the listener hears
+     * grows as configuration files name more package files, so the percentage can step back.
+     */
+    public JSONObject importMnnDirectory(Uri tree, String requestedId, Set<String> declared,
+                                         @Nullable String requestedDisplayName,
+                                         @Nullable ProgressListener listener) throws JSONException {
         File staging = null;
         try {
             String rootId = android.provider.DocumentsContract.getTreeDocumentId(tree);
@@ -169,13 +222,26 @@ public final class TaiModelImporter {
                 return error(409, "model_exists", "Choose a different model name; this one is already in use.");
             java.util.LinkedHashMap<String, Uri> documents = new java.util.LinkedHashMap<>();
             collectDocuments(tree, rootId, "", documents, 0);
+            // A text-to-image folder is decided first: Sana's root config.json is a diffusion
+            // configuration, not an LLM one, and Stable Diffusion's folder has none.
+            int layout = TaiDiffusionImport.detectLayout(documents.keySet());
+            if (layout != TaiDiffusionPackage.TYPE_AUTO) {
+                String folderName = readMetadata(root).displayName;
+                return importDiffusionDirectory(documents, id, destination,
+                    TaiDiffusionImport.typeFor(layout, folderName.isEmpty() ? id : folderName),
+                    requestedDisplayName, listener);
+            }
             if (!documents.containsKey("config.json")) return error(400, "missing_config", "Choose the folder containing config.json.");
             staging = new File(store.getModelsDirectory(), ".import-" + java.util.UUID.randomUUID());
             if (!staging.mkdirs()) throw new java.io.IOException("Could not create the import directory.");
-            copyDocument(documents.get("config.json"), new File(staging, "config.json"));
+            copyDocument(documents.get("config.json"), new File(staging, "config.json"), -1L, null, null);
             java.util.LinkedHashSet<String> required = TaiMnnPackage.files(
                 TaiMnnPackage.readConfig(new File(staging, "config.json")), documents.keySet());
             java.util.ArrayList<String> pending = new java.util.ArrayList<>(required);
+            // Running byte count across the package: {copied so far, expected total}. The total is
+            // the sum of every known dependency's reported size and grows as configs name more.
+            long[] progress = {0L, 0L};
+            for (String name : pending) progress[1] += Math.max(0L, sizeOf(documents.get(name)));
             long size = new File(staging, "config.json").length();
             for (int i = 0; i < pending.size(); i++) {
                 String name = pending.get(i);
@@ -187,11 +253,15 @@ public final class TaiModelImporter {
                     throw new java.io.IOException("Could not create the package directory.");
                 long bytes = readMetadata(document).sizeBytes;
                 if (bytes > 0 && staging.getUsableSpace() < bytes) throw new java.io.IOException("Not enough storage to import this model.");
-                copyDocument(document, output);
+                copyDocument(document, output, bytes, listener, progress);
                 size += output.length();
                 if (name.endsWith(".json")) {
                     TaiMnnPackage.references(TaiMnnPackage.readConfig(output), required);
-                    for (String dependency : required) if (!pending.contains(dependency)) pending.add(dependency);
+                    for (String dependency : required) {
+                        if (pending.contains(dependency)) continue;
+                        pending.add(dependency);
+                        progress[1] += Math.max(0L, sizeOf(documents.get(dependency)));
+                    }
                 }
                 if (pending.size() > 10000) throw new java.io.IOException("Model package has too many files.");
             }
@@ -199,7 +269,9 @@ public final class TaiModelImporter {
             if (!staging.renameTo(destination)) throw new java.io.IOException("Could not finish importing the model.");
             staging = destination;
             File config = new File(destination, "config.json");
-            TaiModelSpec spec = new TaiModelSpec(id, id, "Imported local model", "imported",
+            String displayName = requestedDisplayName == null || requestedDisplayName.trim().isEmpty()
+                ? id : requestedDisplayName.trim();
+            TaiModelSpec spec = new TaiModelSpec(id, displayName, "Imported local model", "imported",
                 config.getAbsolutePath(), "User-provided model; license accepted externally", size,
                 TaiModelStore.mnnPackageCapabilities(config, declared), false, null,
                 TaiModelSpec.BACKEND_MNN_LLM, TaiModelSpec.FORMAT_MNN, null, null, 4096, 0, null);
@@ -207,10 +279,265 @@ public final class TaiModelImporter {
             staging = null;
             return new JSONObject().put("ok", true).put("imported", true).put("model", spec.toJson());
         } catch (Exception e) {
-            return error(400, "model_import_failed", messageOrFallback(e, "Model import failed."));
+            JSONObject result = failed(e);
+            result.put("_statusCode", 400);
+            return result;
         } finally {
             if (staging != null) deleteImportDirectory(staging);
         }
+    }
+
+    /**
+     * Copies a text-to-image folder (Stable Diffusion, Taiyi, Sana) into a private staging directory,
+     * checks it and registers it. Small files go first so a tokenizer the app cannot use is refused
+     * before the graphs are copied; nothing becomes visible unless the whole package checks out.
+     */
+    @NonNull
+    private JSONObject importDiffusionDirectory(@NonNull java.util.Map<String, Uri> documents, @NonNull String id,
+                                                @NonNull File destination, int type,
+                                                @Nullable String requestedDisplayName,
+                                                @Nullable ProgressListener listener) throws JSONException {
+        File staging = new File(store.getModelsDirectory(), ".import-" + java.util.UUID.randomUUID());
+        try {
+            if (!staging.mkdirs()) throw new java.io.IOException("Could not create the import directory.");
+            java.util.List<String> names = TaiDiffusionImport.packageFiles(documents.keySet(), "");
+            long[] progress = {0L, 0L};
+            for (String name : names) progress[1] += Math.max(0L, sizeOf(documents.get(name)));
+            long size = 0L;
+            boolean tokenizerChecked = false;
+            for (String name : names) {
+                if (!tokenizerChecked && TaiDiffusionImport.isHeavy(name)) {
+                    checkDiffusionTokenizer(staging, type);
+                    tokenizerChecked = true;
+                }
+                File output = new File(staging, name);
+                if (!output.getParentFile().isDirectory() && !output.getParentFile().mkdirs())
+                    throw new java.io.IOException("Could not create the package directory.");
+                long bytes = readMetadata(documents.get(name)).sizeBytes;
+                if (bytes > 0 && staging.getUsableSpace() < bytes) throw new java.io.IOException("Not enough storage to import this model.");
+                copyDocument(documents.get(name), output, bytes, listener, progress);
+                size += output.length();
+            }
+            if (!tokenizerChecked) checkDiffusionTokenizer(staging, type);
+            TaiDiffusionPackage.Result checked = TaiDiffusionPackage.inspect(staging, type);
+            if (!checked.ok()) throw new java.io.IOException(checked.message);
+            if (!staging.renameTo(destination)) throw new java.io.IOException("Could not finish importing the model.");
+            staging = null;
+            String displayName = requestedDisplayName == null || requestedDisplayName.trim().isEmpty()
+                ? id : requestedDisplayName.trim();
+            TaiModelSpec spec = TaiDiffusionImport.spec(id, displayName, "imported",
+                "User-provided model; license accepted externally", destination.getAbsolutePath(), checked.type, size);
+            store.upsertUserModel(spec);
+            return new JSONObject().put("ok", true).put("imported", true).put("model", spec.toJson());
+        } catch (Exception e) {
+            JSONObject result = failed(e);
+            result.put("_statusCode", 400);
+            return result;
+        } finally {
+            if (staging != null) deleteImportDirectory(staging);
+        }
+    }
+
+    /**
+     * The model type name ({@code sd15}, {@code taiyi}, {@code sana}) when the chosen folder holds a
+     * text-to-image package, else "". Lists the folder only; nothing is copied.
+     */
+    @NonNull
+    public String diffusionTypeOfFolder(@NonNull Uri tree) {
+        try {
+            String rootId = android.provider.DocumentsContract.getTreeDocumentId(tree);
+            java.util.LinkedHashMap<String, Uri> documents = new java.util.LinkedHashMap<>();
+            collectDocuments(tree, rootId, "", documents, 0);
+            int layout = TaiDiffusionImport.detectLayout(documents.keySet());
+            if (layout == TaiDiffusionPackage.TYPE_AUTO) return "";
+            String folderName = readMetadata(android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, rootId)).displayName;
+            return TaiDiffusionPackage.typeName(TaiDiffusionImport.typeFor(layout, folderName));
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    // ---- folders saved by Export AI models ----
+
+    /** A model folder written by Export AI models: where it is in the picked tree, and what it holds. */
+    public static final class ExportedModel {
+        @NonNull final String documentId;
+        @NonNull public final TaiModelExport.Manifest manifest;
+
+        ExportedModel(@NonNull String documentId, @NonNull TaiModelExport.Manifest manifest) {
+            this.documentId = documentId;
+            this.manifest = manifest;
+        }
+    }
+
+    /**
+     * The saved models in a picked folder: the folder itself when it is one model's folder, else
+     * each model folder directly inside it (the {@link TaiModelExport#FOLDER_NAME} folder the export
+     * made), or inside a {@link TaiModelExport#FOLDER_NAME} folder in it (the folder the export was
+     * pointed at). Empty for any other folder, and when the folder cannot be read. Reads the small
+     * manifests only; nothing is copied.
+     */
+    @NonNull
+    public java.util.List<ExportedModel> exportedModels(@NonNull Uri tree) {
+        java.util.List<ExportedModel> found = new java.util.ArrayList<>();
+        try {
+            String rootId = android.provider.DocumentsContract.getTreeDocumentId(tree);
+            java.util.List<String[]> top = listChildren(tree, rootId);
+            ExportedModel self = exportedModel(tree, rootId, top);
+            if (self != null) {
+                found.add(self);
+                return found;
+            }
+            for (String[] child : top) {
+                if (!android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(child[2])) continue;
+                java.util.List<String[]> children = listChildren(tree, child[0]);
+                ExportedModel model = exportedModel(tree, child[0], children);
+                if (model != null) {
+                    found.add(model);
+                } else if (TaiModelExport.FOLDER_NAME.equals(child[1])) {
+                    // The folder the export was pointed at, picked again: its models sit one level down.
+                    for (String[] grandchild : children) {
+                        if (!android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(grandchild[2])) continue;
+                        ExportedModel nested = exportedModel(tree, grandchild[0], listChildren(tree, grandchild[0]));
+                        if (nested != null) found.add(nested);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            found.clear();
+        }
+        return found;
+    }
+
+    /** The folder's model when it holds a readable manifest, else null. */
+    @Nullable
+    private ExportedModel exportedModel(@NonNull Uri tree, @NonNull String documentId, @NonNull java.util.List<String[]> children) {
+        for (String[] child : children) {
+            if (!TaiModelExport.MANIFEST_NAME.equals(child[1])
+                || android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(child[2])) continue;
+            Uri document = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, child[0]);
+            try (InputStream input = appContext.getContentResolver().openInputStream(document)) {
+                if (input == null) return null;
+                java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    bytes.write(buffer, 0, read);
+                    if (bytes.size() > TaiModelExport.MAX_MANIFEST_BYTES) return null;
+                }
+                return new ExportedModel(documentId,
+                    TaiModelExport.readManifest(new JSONObject(bytes.toString("UTF-8"))));
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /** {document id, display name, MIME type} of each child of {@code documentId}. */
+    @NonNull
+    private java.util.List<String[]> listChildren(@NonNull Uri tree, @NonNull String documentId) throws java.io.IOException {
+        java.util.List<String[]> children = new java.util.ArrayList<>();
+        Uri uri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, documentId);
+        try (Cursor cursor = appContext.getContentResolver().query(uri, new String[]{
+            android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE}, null, null, null)) {
+            if (cursor == null) throw new java.io.IOException("Could not read the selected folder.");
+            while (cursor.moveToNext() && children.size() < TaiModelExport.MAX_FILES) {
+                String id = cursor.getString(0);
+                if (id != null) children.add(new String[]{id, cursor.getString(1), cursor.getString(2)});
+            }
+        }
+        return children;
+    }
+
+    /**
+     * Copies one saved model into app-private storage and registers it under its own id with its
+     * own record, so it comes back as the model it was: the same id (which the feature choices and
+     * per-model settings name), name, capabilities, runtime and files. Every file the manifest
+     * names must be there at its size; the package is checked as a download is before it becomes
+     * visible. A model whose id is already on this phone is left alone ({@code model_exists}).
+     * {@code running} is the byte count across every model being added, for the listener.
+     */
+    @NonNull
+    public JSONObject importExportedModel(@NonNull Uri tree, @NonNull ExportedModel saved,
+                                          @Nullable ProgressListener listener, @NonNull long[] running) throws JSONException {
+        TaiModelExport.Manifest manifest = saved.manifest;
+        File destination = new File(store.getModelsDirectory(), manifest.id);
+        if (destination.exists() || store.getUserModel(manifest.id) != null)
+            return error(409, "model_exists", "This model is already on this phone.");
+        File staging = null;
+        try {
+            java.util.LinkedHashMap<String, Uri> documents = new java.util.LinkedHashMap<>();
+            collectDocuments(tree, saved.documentId, "", documents, 0);
+            if (!store.getModelsDirectory().isDirectory() && !store.getModelsDirectory().mkdirs())
+                throw new java.io.IOException("Could not create the model directory.");
+            staging = new File(store.getModelsDirectory(), ".import-" + java.util.UUID.randomUUID());
+            if (!staging.mkdirs()) throw new java.io.IOException("Could not create the import directory.");
+            for (TaiModelExport.Entry entry : manifest.files) {
+                Uri document = documents.get(entry.path);
+                if (document == null) throw new java.io.IOException("The saved model is missing " + entry.path);
+                File output = new File(staging, entry.path);
+                File parent = output.getParentFile();
+                if (parent == null || !parent.isDirectory() && !parent.mkdirs())
+                    throw new java.io.IOException("Could not create the package directory.");
+                if (staging.getUsableSpace() < entry.size)
+                    throw new java.io.IOException("Not enough storage to import this model.");
+                copyDocument(document, output, entry.size, listener, running);
+                if (output.length() != entry.size)
+                    throw new java.io.IOException("The saved copy of " + entry.path + " is incomplete.");
+            }
+            TaiModelSpec staged = TaiModelExport.restoredSpec(manifest, staging);
+            checkRestored(staged);
+            if (!staging.renameTo(destination)) throw new java.io.IOException("Could not finish importing the model.");
+            staging = null;
+            TaiModelSpec spec = TaiModelExport.restoredSpec(manifest, destination);
+            if (manifest.exposure != null) store.setExposure(spec.id, manifest.exposure);
+            store.upsertUserModel(spec);
+            return new JSONObject().put("ok", true).put("imported", true).put("model", spec.toJson());
+        } catch (Exception e) {
+            JSONObject result = failed(e);
+            result.put("_statusCode", 400);
+            return result;
+        } finally {
+            if (staging != null) deleteImportDirectory(staging);
+        }
+    }
+
+    /** The same readability check each backend's own import or download makes before registering. */
+    private void checkRestored(@NonNull TaiModelSpec spec) throws Exception {
+        File main = new File(spec.localPath == null ? "" : spec.localPath);
+        if (TaiModelSpec.BACKEND_MNN_DIFFUSION.equals(spec.backend)) {
+            TaiDiffusionPackage.Result checked = TaiDiffusionPackage.inspect(main, TaiDiffusionPackage.parseType(spec.architecture));
+            if (!checked.ok()) throw new java.io.IOException(checked.message);
+        } else if (TaiModelSpec.BACKEND_MNN_LLM.equals(spec.backend)) {
+            TaiMnnPackage.validate(main);
+        } else if (!main.isFile() || main.length() == 0L) {
+            // A LiteRT model's sizes were checked file by file above; a voice model's graph can be
+            // smaller than the single-file import's minimum, so only its presence is asked here.
+            throw new ImportFailure(REASON_UNREADABLE, "The saved file does not look like a readable model package.");
+        }
+    }
+
+    /** Installs the bundled Stable Diffusion tokenizer into {@code directory} when it needs and matches it. */
+    private void checkDiffusionTokenizer(@NonNull File directory, int type) throws java.io.IOException {
+        if (type == TaiDiffusionPackage.TYPE_SANA) return;
+        TaiDiffusionTokenizer.Result result = TaiDiffusionTokenizer.ensure(directory, appContext);
+        if (!result.proceed()) throw new java.io.IOException(result.message);
+    }
+
+    /** The {@code model_import_failed} result for an exception, with the reason when the importer knows it. */
+    @NonNull
+    private JSONObject failed(@NonNull Exception e) throws JSONException {
+        JSONObject result = error(500, "model_import_failed", messageOrFallback(e, "Model import failed."));
+        if (e instanceof ImportFailure) result.put("reason", ((ImportFailure) e).reason);
+        else if (e instanceof InterruptedException) result.put("reason", REASON_CANCELLED);
+        return result;
+    }
+
+    private long sizeOf(@Nullable Uri document) {
+        return document == null ? 0L : readMetadata(document).sizeBytes;
     }
 
     private void collectDocuments(Uri tree, String documentId, String prefix,
@@ -269,7 +596,13 @@ public final class TaiModelImporter {
         return new DocumentMetadata(displayName, sizeBytes);
     }
 
-    private void copyDocument(@NonNull Uri uri, @NonNull File output) throws Exception {
+    /**
+     * Copies one document, telling {@code listener} about every megabyte. With a {@code running}
+     * pair the copied bytes add to {@code running[0]} and the total reported is {@code running[1]}
+     * (a package spanning several files); without one the totals are this document's own.
+     */
+    private void copyDocument(@NonNull Uri uri, @NonNull File output, long totalBytes,
+                              @Nullable ProgressListener listener, @Nullable long[] running) throws Exception {
         ContentResolver resolver = appContext.getContentResolver();
         try (InputStream rawInput = resolver.openInputStream(uri)) {
             if (rawInput == null) throw new IllegalStateException("The selected document could not be opened.");
@@ -277,11 +610,26 @@ public final class TaiModelImporter {
                  BufferedOutputStream stream = new BufferedOutputStream(new FileOutputStream(output, false))) {
                 byte[] buffer = new byte[1024 * 1024];
                 int read;
+                long copied = 0L;
+                long lastReported = 0L;
                 while ((read = input.read(buffer)) != -1) {
                     if (Thread.currentThread().isInterrupted()) {
                         throw new InterruptedException("Model import cancelled.");
                     }
                     stream.write(buffer, 0, read);
+                    copied += read;
+                    if (running != null) running[0] += read;
+                    if (listener != null && copied - lastReported >= 1024L * 1024L) {
+                        lastReported = copied;
+                        boolean carryOn = running != null
+                            ? listener.onProgress(running[0], running[1] > 0L ? running[1] : -1L)
+                            : listener.onProgress(copied, totalBytes > 0L ? totalBytes : -1L);
+                        if (!carryOn) throw new InterruptedException("Model import cancelled.");
+                    }
+                }
+                if (listener != null) {
+                    if (running != null) listener.onProgress(running[0], running[1] > 0L ? running[1] : -1L);
+                    else listener.onProgress(copied, totalBytes > 0L ? totalBytes : copied);
                 }
             }
         }
@@ -325,7 +673,7 @@ public final class TaiModelImporter {
         if (TaiModelSpec.BACKEND_MNN_LLM.equals(backend)) {
             if (lower.endsWith("config.json")) return ValidationResult.accepted(false);
             return ValidationResult.rejected(ERROR_UNSUPPORTED_MODEL_FILE,
-                "MNN downloads must start from the model repository config.json URL. Local folder import is not supported by this file picker yet.");
+                "MNN models are folders: choose the folder that contains config.json, or download from the model repository's config.json URL.");
         }
         return ValidationResult.rejected(ERROR_UNSUPPORTED_BACKEND, "Choose LiteRT or MNN before importing.");
     }

@@ -94,11 +94,33 @@ public final class TerminalSheetController
         @Nullable TerminalDress.Source terminalDressSource();
 
         boolean isReducedMotionEnabled();
+
+        /** How glass cards arrive and leave: the look's motion profile, classic unless it says. */
+        @NonNull
+        default com.termux.app.chrome.GlassMotion glassMotion() {
+            return com.termux.app.chrome.GlassMotion.CLASSIC;
+        }
+
+        /**
+         * Whether the plane's glass may light under a finger on a centred card's rows: Fancier
+         * Glass on, and nothing stopping its motions (lazy mode, battery saver). The system's
+         * animation setting and reduced motion are the light's own to ask. Off unless the host says.
+         */
+        default boolean glassTouchLightAllowed() {
+            return false;
+        }
     }
 
     /** The plane's live blur, when the backdrop is not a wallpaper frost. */
     @Nullable private com.github.mmin18.widget.RealtimeBlurView mLiveBlur;
 
+    /**
+     * The light a finger on a centred card's row casts into the plane's frost, built on the first
+     * such card; one serves every card, since one finger rests on one row at a time.
+     */
+    @Nullable private com.termux.app.chrome.GlassTouchLight mTouchLight;
+
+    /** The foot panel's rise and sink; a centred card's own timings are {@code GlassMotion}'s. */
     private static final long ENTER_DURATION_MS = 170L;
     private static final long EXIT_DURATION_MS = 110L;
     /**
@@ -593,6 +615,8 @@ public final class TerminalSheetController
     private void onEmptied() {
         mHost.setSheetInterceptorActive(false);
         if (mPlane != null) mPlane.setVisibility(View.INVISIBLE);
+        // The plane is shut: no light lingers on a frost about to be dropped.
+        if (mTouchLight != null) mTouchLight.reset();
         ImageView frost = mHost.findView(R.id.terminal_sheet_wallpaper_backdrop);
         if (frost != null) {
             // Drop the full-screen frost bitmap while shut; the next show() rebuilds it.
@@ -739,7 +763,8 @@ public final class TerminalSheetController
     private TerminalDrawerMetrics.Bounds leadingBounds() {
         terminalAreaInPlane(mAreaBounds);
         return TerminalDrawerMetrics.place(mAreaBounds.left, mAreaBounds.top, mAreaBounds.width(),
-            mAreaBounds.height(), isRtl(), mDensity);
+            mAreaBounds.height(), isRtl(), mDensity,
+            mHost.context().getResources().getConfiguration().fontScale);
     }
 
     /** How much of the plane's bottom the in-app keyboard is taking. */
@@ -858,7 +883,36 @@ public final class TerminalSheetController
         // list of actions, and a word above it ("Terminal") only spends a row saying where you
         // already are. Prompts and confirmations still title themselves.
         if (title.length() > 0) addHeading(card, context, title);
-        return finishCard(card, content, fillHeight);
+        // Only the centred card is glass a finger presses into: its rows and buttons take the
+        // motion's press feedback (none under classic). The placements are read before finishCard
+        // resets them.
+        boolean centred = !mPendingPlacement.leading && !mPendingPlacement.foot
+            && !mPendingPlacement.strip && mPendingPlacement.anchor == null;
+        View built = finishCard(card, content, fillHeight);
+        if (centred) {
+            // The rows also light the plane's frost under the finger (Fancier Glass only; the
+            // frost's program draws it). The frost is the plane-wide wallpaper ImageView behind
+            // every card, so the finger's position is carried into its coordinates.
+            ImageView frost = mHost.findView(R.id.terminal_sheet_wallpaper_backdrop);
+            if (frost != null) {
+                com.termux.app.chrome.GlassPress.attachClickables(card, mHost::glassMotion,
+                    touchLight(frost), frost);
+            } else {
+                com.termux.app.chrome.GlassPress.attachClickables(card, mHost::glassMotion);
+            }
+        }
+        return built;
+    }
+
+    /** The plane's one touch light, onto {@code frost}'s shared frame. */
+    @NonNull
+    private com.termux.app.chrome.GlassTouchLight touchLight(@NonNull ImageView frost) {
+        if (mTouchLight == null) {
+            mTouchLight = new com.termux.app.chrome.GlassTouchLight(frost.getContext(),
+                com.termux.app.chrome.GlassTouchLight.frostSink(frost),
+                mHost::glassTouchLightAllowed);
+        }
+        return mTouchLight;
     }
 
     /** The strip's flat material: an opaque borderless pill, no glass and no blur. */
@@ -948,12 +1002,20 @@ public final class TerminalSheetController
      * <p>A full-screen scrim would put the dock, the status row and the keys behind glass as well,
      * and none of them is what the drawer is covering. Tapping it closes, like tapping anywhere
      * else outside the card does.
+     *
+     * <p>It wears the terminal's own corners: a square scrim over a rounded frame darkens the
+     * wallpaper in the four notches outside the frame's arcs, so its corners poke past the outline.
+     * The radius is set with the bounds in {@link #applyScrimParams}, which runs again whenever the
+     * area moves.
      */
     @NonNull
     private View buildScrim() {
         View scrim = new View(mStackHost.getContext());
-        scrim.setBackgroundColor(androidx.core.graphics.ColorUtils.setAlphaComponent(
-            android.graphics.Color.BLACK, TerminalDrawerMetrics.SCRIM_ALPHA));
+        android.graphics.drawable.GradientDrawable shape =
+            new android.graphics.drawable.GradientDrawable();
+        shape.setColor(androidx.core.graphics.ColorUtils.setAlphaComponent(
+            android.graphics.Color.BLACK, Math.round(mHost.glassMotion().backdropDim * 255f)));
+        scrim.setBackground(shape);
         scrim.setClickable(true);
         scrim.setOnClickListener(view -> dismiss());
         applyScrimParams(scrim);
@@ -968,6 +1030,15 @@ public final class TerminalSheetController
         terminalAreaInPlane(mAreaBounds);
         setFrameBounds(scrim, mAreaBounds.left, mAreaBounds.top,
             mAreaBounds.width(), mAreaBounds.height());
+        if (scrim.getBackground() instanceof android.graphics.drawable.GradientDrawable) {
+            android.graphics.drawable.GradientDrawable shape =
+                (android.graphics.drawable.GradientDrawable) scrim.getBackground();
+            float radius = TerminalDrawerMetrics.scrimRadiusPx(mHost.terminalCornerRadiusPx(),
+                mAreaBounds.width(), mAreaBounds.height());
+            // Compared first: this runs from the plane's layout listener, and a redundant set
+            // would invalidate the scrim on every pass.
+            if (shape.getCornerRadius() != radius) shape.setCornerRadius(radius);
+        }
     }
 
     private void applyLeadingParams(@NonNull View card,
@@ -982,6 +1053,10 @@ public final class TerminalSheetController
      * listener, and {@code setLayoutParams} asks for another layout — so writing the same numbers
      * back unconditionally would lay the plane out again on every frame for as long as the drawer
      * was open.
+     *
+     * <p>Absolute {@code LEFT}, not {@code START}: the plane follows the locale's direction so the
+     * cards' contents mirror, and a {@code START} child of a right-to-left frame is placed from
+     * the right edge with its left margin ignored.
      */
     private static void setFrameBounds(@NonNull View view, int left, int top, int width,
                                        int height) {
@@ -991,12 +1066,12 @@ public final class TerminalSheetController
             : new FrameLayout.LayoutParams(width, height);
         if (existing == params && params.leftMargin == left && params.topMargin == top
             && params.width == width && params.height == height
-            && params.gravity == (Gravity.TOP | Gravity.START)) return;
+            && params.gravity == (Gravity.TOP | Gravity.LEFT)) return;
         params.width = width;
         params.height = height;
         params.leftMargin = left;
         params.topMargin = top;
-        params.gravity = Gravity.TOP | Gravity.START;
+        params.gravity = Gravity.TOP | Gravity.LEFT;
         view.setLayoutParams(params);
     }
 
@@ -1036,7 +1111,7 @@ public final class TerminalSheetController
 
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width,
             fillHeight ? ViewGroup.LayoutParams.MATCH_PARENT : ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM | Gravity.START);
+            Gravity.BOTTOM | Gravity.LEFT);
         params.leftMargin = left;
         params.topMargin = Math.max(0, top);
         return params;
@@ -1080,7 +1155,7 @@ public final class TerminalSheetController
             top = Math.max(inset, Math.min(top, planeHeight - height - inset));
 
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width,
-            ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START);
+            ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT);
         params.leftMargin = Math.max(0, left);
         params.topMargin = Math.max(0, top);
         return params;
@@ -1141,14 +1216,8 @@ public final class TerminalSheetController
                 });
             return;
         }
-        card.setAlpha(0f);
-        card.setScaleX(0.94f);
-        card.setScaleY(0.94f);
-        card.animate().alpha(1f).scaleX(1f).scaleY(1f)
-            .setDuration(ENTER_DURATION_MS)
-            .setInterpolator(new PathInterpolator(0.2f, 0.8f, 0.2f, 1f))
-            .withEndAction(this::restLiveBlur)
-            .start();
+        com.termux.app.chrome.GlassMotionPlayer.enter(card, mHost.glassMotion(),
+            this::restLiveBlur);
     }
 
     /** One more capture of what is behind the plane, then the blur rests on it. */
@@ -1197,10 +1266,8 @@ public final class TerminalSheetController
                 .start();
             return;
         }
-        card.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f)
-            .setDuration(EXIT_DURATION_MS)
-            .withEndAction(() -> stack.removeView(card))
-            .start();
+        com.termux.app.chrome.GlassMotionPlayer.exit(card, mHost.glassMotion(),
+            () -> stack.removeView(card));
     }
 
     /**

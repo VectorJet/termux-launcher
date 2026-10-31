@@ -36,7 +36,15 @@ emoji, clipboard history, voice switching, direct-boot state, fold/window
 tracking, layout editor UI, numeric-editor inference,
 split/landscape modifiers, panes, and their resources. It also excludes
 `res/layout/keyboard.xml`, `res/xml/split_middle_column.xml`, and
-settings/method resources.
+settings/method resources. Upstream's clipboard pane stays excluded, but its
+key is live: `switch_clipboard` / `switch_back_clipboard` (`Event.SWITCH_CLIPBOARD`,
+`SWITCH_BACK_CLIPBOARD`) are dispatched by the launcher's
+`TerminalKeyEventHandler` to its own clipboard panel
+(`app/.../terminal/inappkeyboard/ClipboardPanelView`), which stands over the
+keys in the host the way the mouse-mode touchpad does. The module itself is
+unchanged for this; the bundled `termux_launcher_qwerty.xml` already carried
+the key as a `loc` slot on Ctrl, and the launcher's extra-keys catalogue now
+enables it by default.
 
 ## Generated layout catalogue
 
@@ -122,40 +130,45 @@ fails when the catalogue has gone stale.
   tool keys are freshly built on every `getKeyByName`, so without them a tool
   key could not be looked up in the key maps `addExtraKeys` uses.
 - Split keyboard type (local addition): the new file `SplitLayout.java`, the
-  `LayoutModifier.gapUnits`/`LayoutModifier.split` delegates in front of it, and
-  `Keyboard2View.setSplitGapUnits`/`getSplitGapUnits`/`getSplitGapBounds`.
+  `LayoutModifier.gapUnits`/`LayoutModifier.split` delegates in front of it,
+  `Keyboard2View.setSplitGapUnits`/`getSplitGapUnits`/`getSplitGapBounds`, and
+  the `split_before`/`split_at` key attributes (`KeyboardData.Key.splitAt`,
+  carried through every key copy and scaled by `scaleWidth`).
   Upstream's own split — `split_middle_column.xml` plus its layout modifier —
   was not ported (see "Deliberate removals"); this one is a step of its own
-  after `modify`, parting every composed row at its midpoint by a gap given in
-  key-width units. A key straddling the midpoint is cut into two keys of the
-  same values only when it is at least 1.5 units wide — the space bar; a letter
-  key keeps its shape and the parting takes its nearer edge, so the halves may
-  differ by one key. The view is told the same gap: it then keeps no view
-  background and paints one slab under each run of keys instead, and refuses
-  (`onTouch` returns false) a press that starts in the parting, so the press
-  reaches whatever the keyboard is over. Both are inert at gap zero, which is
-  the docked keyboard.
+  after `modify` that lays the composed layout out as two rectangular halves
+  against the edges with one straight gap between them, given in key-width
+  units. Each row is cut once: before a key marked `split_before="true"`, inside
+  a key at its `split_at` offset, or else at the key edge nearest the row's
+  midpoint (a key of 1.5 units or more — the space bar — is cut there instead).
+  Both halves are C wide, the widest run on either side of any row; left runs
+  keep their place, right runs are pushed to end on the right edge, so the band
+  [C, C+G] is clear on every row and letter keys keep one width throughout. A
+  cut key's two pieces both type its centre value; the west swipes stay left,
+  the east ones go right, north/south and the circle go to the wider piece. The
+  view is told the same gap, and only its keys part: the view background still
+  fills it, and a press in the parting is the keyboard's and lands on no key,
+  as upstream treats any press between keys. `getSplitGapBounds` reports the
+  strip between the two key runs (the band, cell edge to cell edge, the view's
+  full height); `getSplitGapKeyBounds` reports where a key standing in that
+  strip would be drawn (inset by half a key margin, so it keeps a whole margin
+  from the caps beside it, and spanning the first row's cap top to the last
+  row's cap bottom). Both are false at gap zero, which is the docked keyboard.
 - Parting asked for in pixels (local addition):
-  `SplitLayout.gapUnitsForPx`/`commonGapUnitsForPx` with `MAX_GAP_FRACTION`, the
-  `LayoutModifier.commonGapUnitsForPx` delegate, and
-  `Keyboard2View.getKeyContentWidthPx`/`splitSlabRadiusPx`. The launcher stands
+  `SplitLayout.gapUnitsForPx` with `MAX_GAP_FRACTION`, the
+  `LayoutModifier.gapUnitsForPx` delegate, and
+  `Keyboard2View.getKeyContentWidthPx`/`getKeyCapRadiusPx`/`getKeyCapColor`.
+  The launcher stands
   its mouse-mode touchpad in the parting and needs a floor on it in dp, but the
   parting is stored in key-width units and parting widens the keyboard, so the
-  units that buy a pixel shrink as the gap grows; `gapUnitsForPx` inverts that,
-  and `commonGapUnitsForPx` adds back what the common band loses to rows parting
-  at different key boundaries (a fixed offset, so one correction is exact). The
-  ask is capped at half the width so both halves keep their keys.
-  `getKeyContentWidthPx` is the width the keys are laid out across, which is what
-  the conversion is measured against; `splitSlabRadiusPx` is the corner radius
-  `drawSplitBackground` gives the run slabs, so a host panel standing in the
-  parting takes the same shape.
-- Split slab colour (local addition): `Keyboard2View.setSplitBackgroundColor`
-  and `getSplitBackgroundColor`. The slabs are the panel a parted keyboard lies
-  on rather than a fill inside one of the host's surfaces, so the host picks
-  their colour — the launcher hands in its own overlay surface role, which no
-  module-side theme attribute could name. Null, the default, paints them in the
-  keyboard's own background exactly as before, so nothing changes for a host
-  that says nothing.
+  units that buy a pixel shrink as the gap grows; `gapUnitsForPx` inverts that.
+  The band is the same on every row, so no per-row correction is needed, and
+  the floor is the strip `getSplitGapBounds` reports. The ask is capped at half
+  the width so both halves keep their keys. `getKeyContentWidthPx` is the width
+  the keys are laid out across, which is what the conversion is measured
+  against; `getKeyCapRadiusPx` (the caps' fill radius out to the stroke's outer
+  edge) and `getKeyCapColor` (a letter cap's plain fill) let a host panel
+  seated at `getSplitGapKeyBounds` read as one more key.
 - Stateful suggestion labels have no global provider and render empty.
 - Key rect probe (local addition): `Keyboard2View.getKeyRectOnScreen` and its
   `getSpaceBarRectOnScreen` alias. The host has to be able to point at a key —
@@ -188,16 +201,34 @@ fails when the catalogue has gone stale.
   `InAppKeyboardColorScheme.applyToPalette`, and `KeyboardColorSchemeFragment`'s preview-only
   `withKeyboardBackground` copy) renders function keys like ordinary letter keys instead of
   losing color entirely.
-- Tap correction hook (local addition): `Keyboard2View.TapResolver` plus
-  `setTapResolver`, and the new file `TapGeometry.java`. At `ACTION_DOWN` the
-  view resolves the static grid as upstream does, then lets the host resolver
-  move the press to another key index before `Pointers.onTouchDown`; the raw
-  point still reaches `Pointers`, so swipe directions are unchanged. At
-  `ACTION_UP` the resolver is told the raw key, the down point and whether
-  `TouchFx.swiped` fired. `TouchFx` gained a `rawKey` field for that. The
-  colour-editor paint path (`paintKeyAt`) never consults the resolver. The
-  model itself lives in the launcher
-  (`app/.../terminal/inappkeyboard/TapModel`, `TapModelStore`,
+- Tap correction hook (local addition): `Keyboard2View.TapResolver`,
+  `Keyboard2View.TapRelease` and `setTapResolver`, and the new file
+  `TapGeometry.java`. `ACTION_DOWN` is upstream's: the pointer holds the key
+  under the finger (the raw key), so its highlight, swipe legends, long press
+  and key repeat are always that key's. At `ACTION_UP`, before
+  `Pointers.onTouchUp` sends anything, a press that is still a plain tap
+  (`Pointers.plainTapModifiers`: never left its centre, never long-pressed or
+  repeated, never slid, not a modifier or latched key, and `TouchFx.swiped`
+  never fired) and has neither Ctrl nor Alt held (a shortcut is never
+  corrected) is offered to `resolveTap`; when the host names another key,
+  `Pointers.retargetPlainTap` swaps the pointer's key and value (re-modified
+  under the same modifiers) so that key is sent instead. There is no extra
+  highlight for a corrected tap. Every release, and every press an
+  `ACTION_CANCEL` takes, is reported to `observeTap` as a `TapRelease`: raw and
+  sent key, finger-down point, plain or not, whether Ctrl or Alt was held,
+  down and up times, and `getTouchMajor` at finger-down in key units.
+  `Pointers.Pointer.key` is no longer final and `Pointer` gained a `held` flag
+  set when the long-press timer fires; `TouchFx` holds only the raw key plus
+  its contact size. `TapGeometry` labels each key's role (character, space,
+  Esc, Tab, Backspace, other) and which keys may be corrected: characters,
+  space, Esc and Tab. Its `signature` hashes only the layout's own units —
+  each row's key count, shift and height, each key's shift, width and role —
+  never the rendered key width or row height, so a resize or edge-gap change
+  keeps the host's learned grid and an edit to the keys starts a new one. The
+  coordinates themselves stay in rendered key widths on both axes; the host
+  turns vertical offsets into key heights. The colour-editor paint path (`paintKeyAt`) never
+  consults the resolver. The engine itself lives in the launcher
+  (`app/.../terminal/inappkeyboard/touch/`, adapted by `TapModelStore` and
   `TapCorrectionController`); the module holds no learning logic.
 - Pressed-key popup hook (local addition): `Pointers.IPointerPreview` plus
   `Pointers.setPreviewHandler`, a `slot` field on `Pointer`, and
@@ -218,7 +249,40 @@ fails when the catalogue has gone stale.
   launcher (`app/.../terminal/inappkeyboard/KeyPopupOverlayView`,
   `KeyPopupGeometry`, `KeyPopupPalette`, `KeyPopupController`); the module draws
   none of it.
+- Label faces (local addition): upstream draws every label in the system font
+  except `FLAG_KEY_FONT` values, which use `special_font.ttf`. Here `Config`
+  carries `labelFont` (the face the user picks for labels) and `symbolFont`
+  (the launcher's bundled Nerd Font symbols), and `LabelFace` (no upstream
+  counterpart) picks one of three faces per label: the key font for
+  `FLAG_KEY_FONT`, `symbolFont` for any label holding a private-use code point
+  (the space bar's `tool:<id>:<glyph>` swipe icons are Nerd Font glyphs a picked
+  font lacks), `labelFont` for the rest. So `Theme.Computed.Key` holds a third
+  pair of label paints and `label_paint` / `sublabel_paint` take the label text
+  beside the key-font flag; `Keyboard2View.symbolFont()` hands the face to the
+  launcher's popup.
 - Logging, utilities, and haptics are reduced to the retained embedded needs.
+- Per-key color overrides (local addition: `KeyColorOverride`, the host's color-scheme
+  overrides and the keybind hint lighting with its breath and fade-out) reach the draw path as
+  primitives. `onDraw` resolves a key's overrides into one reused `OverrideSlots` (a set flag
+  and an `int` per slot) instead of passing boxed `Integer`s, and the hint fade-out blends into
+  that same instance instead of allocating a `KeyColorOverride` per lit key per frame. So
+  `drawKeyFrame`, `drawLabel` and `drawSubLabel` take `(boolean has…, int color)` pairs where
+  upstream's `drawKeyFrame` takes no override and the labels take none. Upstream draws no
+  overrides, so a refresh keeps upstream's drawing and re-applies these parameters.
+  A border override on a theme whose border width is 0 (the launcher's palettes draw no key
+  borders) is stroked at 1dp, so the colour scheme's Border role is visible; the keybind hint
+  lighting's border does not add one.
+- Enter's north swipe in the bundled `termux_launcher_qwerty.xml` (2026-10-09) is
+  `tool:voice.dictate` — the launcher's own dictation — not upstream's `voice_typing`, which hands
+  off to the voice engine the settings name (possibly the system's).
+- Picture paste glyph (local addition, 2026-10-12): `Keyboard2View.setPasteShowsPicture`,
+  pushed by the launcher while paste will put in a picture (one on the clipboard, or a fresh
+  screenshot it offers), makes `drawLabel`, `drawSubLabel`,
+  the corner-bounds probe and the popup labels draw `paste` and `pasteAsPlainText` as Nerd Font
+  nf-md-image (U+F02E9, symbols face) instead of their key-font glyphs. Only the drawn label
+  changes, drawn at `PASTE_PICTURE_SCALE` (0.78) of the key's size so the full-em picture
+  matches the key-font glyphs beside it; colour and the value sent are the key's own. Upstream has
+  no such state.
 
 ## Refresh procedure
 

@@ -62,6 +62,21 @@ public class TerminalWindowBarTest {
     }
 
     @Test
+    public void aShorterListBeforeTheScrollRunsDoesNotCrash() {
+        // Attached, as on the phone: a detached view holds its posts until it is attached.
+        android.app.Activity activity = org.robolectric.Robolectric.buildActivity(android.app.Activity.class).setup().get();
+        TerminalWindowBar bar = new TerminalWindowBar(activity, null);
+        activity.setContentView(bar);
+        bar.setWindows(Arrays.asList(
+            new TerminalWindowBar.WindowItem("one", "one"),
+            new TerminalWindowBar.WindowItem("two", "two"),
+            new TerminalWindowBar.WindowItem("three", "three")), 2);
+        bar.setWindows(Collections.singletonList(new TerminalWindowBar.WindowItem("one", "one")), 0);
+        org.robolectric.shadows.ShadowLooper.idleMainLooper();
+        assertEquals(0, bar.getScrollX());
+    }
+
+    @Test
     public void addWindowIcon_isGeometricallyCenteredWithoutTextPadding() {
         TerminalWindowBar bar = new TerminalWindowBar(ApplicationProvider.getApplicationContext(), null);
         bar.setWindows(Arrays.asList(new TerminalWindowBar.WindowItem("home", "home")), 0);
@@ -166,8 +181,12 @@ public class TerminalWindowBarTest {
         assertEquals("work", ((TextView) tabs.getChildAt(1)).getText().toString());
     }
 
+    /**
+     * A window that is working and asking wears the ask: the mark tints the chip instead of the
+     * breath, so it holds still and costs no frames, and the breath comes back once it is seen.
+     */
     @Test
-    public void attentionAndBusyBothShow_onTheCornerAndOnTheOutline() {
+    public void aBellOutranksTheBreathAndHandsItBackOnceSeen() {
         TerminalWindowBar.WindowItem both = new TerminalWindowBar.WindowItem("home", "home")
             .withBusy(true).withAttention(true);
         assertTrue(both.busy);
@@ -179,18 +198,54 @@ public class TerminalWindowBarTest {
         TerminalWindowBar bar = attachedBar();
         bar.setWindows(Arrays.asList(both), 0);
         LinearLayout tabs = (LinearLayout) bar.getChildAt(0);
-        // The label is the title alone either way; the bell has the corner and the ring has the
-        // outline, so a window that is working and asking now says both at once.
+        // The label is the title alone either way; the bell takes the whole chip, still.
         assertEquals("home", ((TextView) tabs.getChildAt(0)).getText().toString());
         assertEquals(ChipWatermarkDrawable.Mark.ATTENTION, bar.chipWatermarkAt(0).mark());
         assertTrue(bar.chipWatermarkAt(0).busy());
-        assertTrue(bar.isBusyAnimationRunning());
+        assertFalse(bar.chipWatermarkAt(0).breathing());
+        assertFalse("a marked chip is static", TerminalWindowBar.needsClock(both));
+        assertFalse(bar.isBusyAnimationRunning());
 
-        // Acknowledged, the corner clears and the ring keeps turning.
+        // Lazy mode's working tint gives way to the mark the same way.
+        bar.setLazyMode(true);
+        assertFalse(bar.chipWatermarkAt(0).workingTint());
+        bar.setLazyMode(false);
+
+        // Acknowledged, the mark clears and the breath comes back.
         bar.setWindows(Arrays.asList(both.withAttention(false)), 0);
         assertEquals(ChipWatermarkDrawable.Mark.NONE, bar.chipWatermarkAt(0).mark());
         assertTrue(bar.chipWatermarkAt(0).busy());
+        assertTrue(bar.chipWatermarkAt(0).breathing());
+        assertTrue(TerminalWindowBar.needsClock(both.withAttention(false)));
         assertTrue(bar.isBusyAnimationRunning());
+    }
+
+    /**
+     * Each mark tints the chip in its own colour: done in the done colour and filled, attention in
+     * the attention colour and filled, and a failure in the attention colour as an edge alone — the
+     * hollow form is all that tells it from a window asking for the user.
+     */
+    @Test
+    public void eachMarkWearsItsColourAndOnlyAFailureGoesUnfilled() {
+        assertFalse(ChipWatermarkDrawable.Mark.NONE.filled());
+        assertTrue(ChipWatermarkDrawable.Mark.ATTENTION.filled());
+        assertTrue(ChipWatermarkDrawable.Mark.DONE.filled());
+        assertFalse(ChipWatermarkDrawable.Mark.FAILED.filled());
+
+        TerminalWindowBar bar = attachedBar();
+        TerminalWindowBar.WindowItem item = new TerminalWindowBar.WindowItem("build", "build");
+        bar.setWindows(Arrays.asList(item.withAttention(true), item.withDone(true),
+            item.withDone(true, true)), 0);
+        ChipWatermarkDrawable attention = bar.chipWatermarkAt(0);
+        ChipWatermarkDrawable done = bar.chipWatermarkAt(1);
+        ChipWatermarkDrawable failed = bar.chipWatermarkAt(2);
+        assertEquals(ChipWatermarkDrawable.Mark.ATTENTION, attention.mark());
+        assertEquals(ChipWatermarkDrawable.Mark.DONE, done.mark());
+        assertEquals(ChipWatermarkDrawable.Mark.FAILED, failed.mark());
+        assertTrue("done is not the attention colour", done.markColor() != attention.markColor());
+        assertEquals(attention.markColor(), failed.markColor());
+        // None of the three asks the bar for frames.
+        assertFalse(bar.isBusyAnimationRunning());
     }
 
     /**
@@ -420,6 +475,17 @@ public class TerminalWindowBarTest {
         assertEquals(ProcessGlyphs.DEFAULT, TerminalWindowBar.glyphOf(unknown.label));
     }
 
+    /** "termi…ser" names nothing: terminal-browser keeps its whole name, under a globe. */
+    @Test
+    public void terminalBrowserWearsItsWholeNameAndTheGlobe() {
+        TerminalWindowBar.WindowItem browser =
+            TerminalWindowBar.itemForForegroundProcess("terminal-browser", null);
+        assertEquals(new String(Character.toChars(0xF059F)), TerminalWindowBar.glyphOf(browser.label));
+        assertEquals("terminal-browser", TerminalWindowBar.titleOf(browser.label));
+        // Every other long name is still cut to nine.
+        assertEquals("some-…ool", TerminalWindowBar.truncateProcess("some-long-tool"));
+    }
+
     /**
      * A shell that reports a percentage gets a filling ring rather than a turning one, so nothing
      * needs frames — and the number is spoken, since the ring cannot be.
@@ -473,6 +539,33 @@ public class TerminalWindowBarTest {
         assertFalse(tabs.getChildAt(1).getContentDescription().toString().contains("working"));
     }
 
+    /**
+     * Lazy mode draws a working window as a still colour: the chip is tinted and nothing runs a
+     * clock, however long the window stays busy. Normal mode keeps the turning ring, and a reported
+     * percentage keeps its still ring in either mode.
+     */
+    @Test
+    public void lazyModeTintsAWorkingChipInsteadOfTurningARing() {
+        TerminalWindowBar bar = attachedBar();
+        TerminalWindowBar.WindowItem item = new TerminalWindowBar.WindowItem("home", "home").withBusy(true);
+        bar.setWindows(Arrays.asList(item), 0);
+        assertTrue(bar.isBusyAnimationRunning());
+        assertFalse(bar.chipWatermarkAt(0).workingTint());
+
+        bar.setLazyMode(true);
+        assertFalse("lazy mode must not run any clock for a working window", bar.isBusyAnimationRunning());
+        assertTrue(bar.chipWatermarkAt(0).busy());
+        assertTrue(bar.chipWatermarkAt(0).workingTint());
+
+        bar.setWindows(Arrays.asList(item.withProgress(40, false)), 0);
+        assertFalse("a reported percentage keeps its still ring", bar.chipWatermarkAt(0).workingTint());
+
+        bar.setLazyMode(false);
+        bar.setWindows(Arrays.asList(item), 0);
+        assertTrue(bar.isBusyAnimationRunning());
+        assertFalse(bar.chipWatermarkAt(0).workingTint());
+    }
+
     @Test
     public void busyGoingIdleStopsTheAnimation() {
         TerminalWindowBar bar = attachedBar();
@@ -486,12 +579,12 @@ public class TerminalWindowBarTest {
     }
 
     /**
-     * The turning arc used to be driven by a ValueAnimator, so it redrew every working pill once
-     * per vsync — 154 times a turn on a 120 Hz panel, and a Choreographer callback every frame for
-     * as long as any shell was working. It now runs on a clock of its own at about 30 a second.
+     * The working ring used to be driven by a ValueAnimator, so it redrew every working pill once
+     * per vsync, a Choreographer callback every frame for as long as any shell was working. The
+     * breath runs on a clock of its own, four steps a second.
      */
     @Test
-    public void aTurningRingRedrawsOnItsOwnClockRatherThanEveryVsync() {
+    public void aBreathingChipRedrawsOnItsOwnClockRatherThanEveryVsync() {
         TerminalWindowBar bar = attachedBar();
         bar.setWindows(Arrays.asList(
             new TerminalWindowBar.WindowItem("home", "home", true)), 0);
@@ -499,18 +592,19 @@ public class TerminalWindowBarTest {
         int before = bar.mRingRedraws;
 
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
-            .idleFor(com.termux.app.statusbar.WindowActivityRing.SPIN_MS,
+            .idleFor(4000L,
                 java.util.concurrent.TimeUnit.MILLISECONDS);
 
         int redraws = bar.mRingRedraws - before;
-        assertTrue("one turn cost " + redraws + " redraws", redraws >= 30 && redraws <= 45);
+        // Four seconds at 4 Hz is about sixteen steps; vsync would be hundreds.
+        assertTrue("4 s cost " + redraws + " redraws", redraws >= 14 && redraws <= 18);
 
         // And it stops with the work, rather than ticking on behind an idle row.
         bar.setWindows(Arrays.asList(new TerminalWindowBar.WindowItem("home", "home")), 0);
         assertFalse(bar.isBusyAnimationRunning());
         int settled = bar.mRingRedraws;
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
-            .idleFor(com.termux.app.statusbar.WindowActivityRing.SPIN_MS,
+            .idleFor(4000L,
                 java.util.concurrent.TimeUnit.MILLISECONDS);
         assertEquals(settled, bar.mRingRedraws);
     }
@@ -580,54 +674,20 @@ public class TerminalWindowBarTest {
     }
 
     @Test
-    public void edgeOverswipeStreamsTheSurplusDistanceAndFollowsAReversal() {
+    public void aDragPastTheEndOfThePillsJustStopsThere() {
         TerminalWindowBar bar = new TerminalWindowBar(ApplicationProvider.getApplicationContext(), null);
-        List<String> events = new ArrayList<>();
-        List<Float> offsets = new ArrayList<>();
-        bar.setOnEdgeOverswipeListener(new TerminalWindowBar.OnEdgeOverswipeListener() {
-            @Override public boolean onEdgeOverswipeBegin() { events.add("begin"); return true; }
-            @Override public void onEdgeOverswipe(float dxPx) { offsets.add(dxPx); }
-            @Override public void onEdgeOverswipeEnd(float velocityPxPerSec) { events.add("end"); }
-            @Override public void onEdgeOverswipeCancel() { events.add("cancel"); }
-        });
         bar.measure(exact(220), exact(30));
         bar.layout(0, 0, 220, 30);
 
-        // An empty strip cannot scroll at all, so every pixel of a horizontal drag is surplus.
-        int slop = android.view.ViewConfiguration.get(bar.getContext()).getScaledTouchSlop();
-        touch(bar, android.view.MotionEvent.ACTION_DOWN, 20, 15);
-        touch(bar, android.view.MotionEvent.ACTION_MOVE, 80, 15);
-        assertEquals(Collections.singletonList("begin"), events);
-        // The slop that proved the intent is not travel, but the distance beyond it is: a coarse
-        // first move must not be thrown away.
-        assertEquals(60f - slop, offsets.get(0), 0.01f);
-        touch(bar, android.view.MotionEvent.ACTION_MOVE, 120, 15);
-        assertEquals(100f - slop, offsets.get(offsets.size() - 1), 0.01f);
-        // A reversal walks the offset back rather than dropping the stream.
-        touch(bar, android.view.MotionEvent.ACTION_MOVE, 60, 15);
-        assertEquals(40f - slop, offsets.get(offsets.size() - 1), 0.01f);
-        touch(bar, android.view.MotionEvent.ACTION_UP, 60, 15);
-        assertEquals(Arrays.asList("begin", "end"), events);
-    }
-
-    @Test
-    public void aHostThatDeclinesTheSurplusLeavesTheStripScrolling() {
-        TerminalWindowBar bar = new TerminalWindowBar(ApplicationProvider.getApplicationContext(), null);
-        List<String> events = new ArrayList<>();
-        bar.setOnEdgeOverswipeListener(new TerminalWindowBar.OnEdgeOverswipeListener() {
-            @Override public boolean onEdgeOverswipeBegin() { events.add("begin"); return false; }
-            @Override public void onEdgeOverswipe(float dxPx) { events.add("drag"); }
-            @Override public void onEdgeOverswipeEnd(float velocityPxPerSec) { events.add("end"); }
-            @Override public void onEdgeOverswipeCancel() { events.add("cancel"); }
-        });
-        bar.measure(exact(220), exact(30));
-        bar.layout(0, 0, 220, 30);
-
+        // An empty strip cannot scroll at all, so every pixel of a horizontal drag is past the end.
+        // Paging the wall belongs to the border drag alone: the strip keeps its place and the
+        // stream is its own from the DOWN to the UP.
         touch(bar, android.view.MotionEvent.ACTION_DOWN, 20, 15);
         touch(bar, android.view.MotionEvent.ACTION_MOVE, 120, 15);
-        touch(bar, android.view.MotionEvent.ACTION_UP, 120, 15);
-        assertFalse(events.contains("drag"));
-        assertFalse(events.contains("end"));
+        assertEquals(0, bar.getScrollX());
+        touch(bar, android.view.MotionEvent.ACTION_MOVE, 20, 15);
+        touch(bar, android.view.MotionEvent.ACTION_UP, 20, 15);
+        assertEquals(0, bar.getScrollX());
     }
 
     /**

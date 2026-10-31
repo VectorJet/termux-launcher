@@ -1,0 +1,9 @@
+# tlstore release the APK ships; bump with the block tlstore's scripts/release.sh prints.
+tag 2026.10.19-2
+54b6139e821fc7999d9193aa0a5ad00e5eede2d12456728f17b8e8a1d06e4064  tlstore
+672d0ed03635e6e4a950954f0a09c5ae8d7c4eb3efbd9428e8aa913c5fc4367c  tlstore.minisig
+7861bef674dab70dbc6766e4e3a1b18c6a6e0fccc09eff0797d47796c978d8a0  catalog.tsv
+2565fccef6c8980b1a76b929448224b143ecb00d2d609c242007239f3ab2dbf1  catalog.tsv.minisig
+2c2fb76510fd6bc8eb7960043329a6a46f9fb99a1e7ae38a38f2c216faa2685a  trusted.pub
+4423d6baf221a289e55b6af596cdc646da5a2a397123834d1dd767cae49e5897  tlstore-ui-arm64-v8a
+10d5dcfce1b392aee022f5ab49d72cf0b9d14f865672946b61f6763baaa9464f  tlstore-ui-x86_64

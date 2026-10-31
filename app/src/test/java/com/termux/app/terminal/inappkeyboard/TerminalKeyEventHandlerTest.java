@@ -180,6 +180,7 @@ public class TerminalKeyEventHandlerTest {
         for (KeyValue.Editing editing : KeyValue.Editing.values()) {
             int copies = mHost.copies;
             int pastes = mHost.pastes;
+            int clipboardPastes = mHost.clipboardPastes;
             int keys = mTerminal.keyCalls.size();
             int codePoints = mTerminal.codePointCalls.size();
             int logs = mHost.logs.size();
@@ -193,8 +194,13 @@ public class TerminalKeyEventHandlerTest {
                     assertEquals(copies + 1, mHost.copies);
                     break;
                 case PASTE:
-                case PASTE_PLAIN:
                     assertEquals(pastes + 1, mHost.pastes);
+                    assertEquals(clipboardPastes, mHost.clipboardPastes);
+                    break;
+                case PASTE_PLAIN:
+                    // Plain paste is always the clipboard, never a screenshot the keyboard offers.
+                    assertEquals(clipboardPastes + 1, mHost.clipboardPastes);
+                    assertEquals(pastes, mHost.pastes);
                     break;
                 case CUT:
                     assertEquals(1, mHost.cuts);
@@ -277,9 +283,13 @@ public class TerminalKeyEventHandlerTest {
                     break;
                 case SWITCH_EMOJI:
                 case SWITCH_BACK_EMOJI:
+                    assertEquals(logs + 1, mHost.logs.size());
+                    break;
                 case SWITCH_CLIPBOARD:
                 case SWITCH_BACK_CLIPBOARD:
-                    assertEquals(logs + 1, mHost.logs.size());
+                    // The clipboard key is the launcher's own panel now, not a stripped pane.
+                    assertEquals(logs, mHost.logs.size());
+                    assertEquals(hostActions + 1, mHost.totalActions());
                     break;
                 case SWITCH_VOICE_TYPING:
                 case SWITCH_VOICE_TYPING_CHOOSER:
@@ -595,6 +605,17 @@ public class TerminalKeyEventHandlerTest {
     }
 
     @Test
+    public void pasteMayBeAScreenshotButPlainPasteIsTheClipboard() {
+        mHandler.key_up(KeyValue.getKeyByName("paste"), Pointers.Modifiers.EMPTY);
+        assertEquals(1, mHost.pastes);
+        assertEquals(0, mHost.clipboardPastes);
+
+        mHandler.key_up(KeyValue.getKeyByName("pasteAsPlainText"), Pointers.Modifiers.EMPTY);
+        assertEquals(1, mHost.pastes);
+        assertEquals(1, mHost.clipboardPastes);
+    }
+
+    @Test
     public void aDispatchedValueReachesTheTerminalWhenNothingClaimsIt() {
         mHandler.dispatchKeyValue(KeyValue.getKeyByName("paste"));
 
@@ -609,6 +630,37 @@ public class TerminalKeyEventHandlerTest {
         CodePointCall call = mTerminal.codePointCalls.get(0);
         assertEquals((int) '_', call.codePoint);
         assertTrue(call.ctrl);
+    }
+
+    @Test
+    public void dispatchKeyValueUnderCtrlSendsTheControlCharacterLikeTheKeyboardDoes() {
+        // A spoken "control c" is the "c" character key with Ctrl added to the held modifiers.
+        mHandler.dispatchKeyValue(KeyValue.getKeyByName("c"), true);
+
+        assertEquals(1, mTerminal.codePointCalls.size());
+        CodePointCall call = mTerminal.codePointCalls.get(0);
+        assertEquals((int) 'c', call.codePoint);
+        assertTrue(call.ctrl);
+        assertFalse(call.alt);
+
+        // Without Ctrl the same call is plain typing, and a named key is a key event.
+        mHandler.dispatchKeyValue(KeyValue.getKeyByName("c"), false);
+        assertFalse(mTerminal.codePointCalls.get(1).ctrl);
+        mHandler.dispatchKeyValue(KeyValue.getKeyByName("enter"), false);
+        assertEquals(Collections.singletonList(KeyEvent.KEYCODE_ENTER), mTerminal.keyCodes);
+    }
+
+    @Test
+    public void dispatchKeyValueUnderCtrlGoesToTheInterceptorFirst() {
+        List<Boolean> ctrls = new ArrayList<>();
+        mHandler.setKeyValueInterceptor((value, ctrl, alt, shift) -> {
+            ctrls.add(ctrl);
+            return true;
+        });
+        mHandler.dispatchKeyValue(KeyValue.getKeyByName("c"), true);
+
+        assertEquals(Collections.singletonList(true), ctrls);
+        assertTrue(mTerminal.codePointCalls.isEmpty());
     }
 
     private static final class KeyCall {
@@ -672,6 +724,7 @@ public class TerminalKeyEventHandlerTest {
     private static final class FakeHostActions implements HostActions {
 
         private int pastes;
+        private int clipboardPastes;
         private int copies;
         private int selectAlls;
         private int cuts;
@@ -682,6 +735,7 @@ public class TerminalKeyEventHandlerTest {
         private int previousLayouts;
         private int settings;
         private int hides;
+        private int clipboardPanels;
         private int capsLocks;
         private int voiceRequests;
         private final List<Boolean> composeStates = new ArrayList<>();
@@ -697,6 +751,11 @@ public class TerminalKeyEventHandlerTest {
         @Override
         public void paste() {
             pastes++;
+        }
+
+        @Override
+        public void pasteClipboard() {
+            clipboardPastes++;
         }
 
         @Override
@@ -751,6 +810,16 @@ public class TerminalKeyEventHandlerTest {
         }
 
         @Override
+        public void showClipboardPanel() {
+            clipboardPanels++;
+        }
+
+        @Override
+        public void hideClipboardPanel() {
+            clipboardPanels++;
+        }
+
+        @Override
         public void requestVoiceTyping(boolean chooser) {
             voiceRequests++;
         }
@@ -776,8 +845,8 @@ public class TerminalKeyEventHandlerTest {
         }
 
         private int totalActions() {
-            return pastes + copies + textLayouts + numericLayouts + greekLayouts + nextLayouts +
-                previousLayouts + settings + hides + capsLocks + voiceRequests;
+            return pastes + clipboardPastes + copies + textLayouts + numericLayouts + greekLayouts + nextLayouts +
+                previousLayouts + settings + hides + clipboardPanels + capsLocks + voiceRequests;
         }
     }
 }

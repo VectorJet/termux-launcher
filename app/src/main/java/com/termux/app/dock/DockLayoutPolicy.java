@@ -25,16 +25,37 @@ public final class DockLayoutPolicy {
     /** Where the dock size sliders land; index 2 is the shipped default. */
     private static final float[] SIZE_PRESETS = {1.72f, 1.95f, 2.18f, 2.45f};
 
-    /** The size-progress window the presets are normalized into. */
+    /**
+     * The size-progress window the presets are normalized into: progress 0 at the first figure,
+     * 1 at the second. It is the unit every curve below is drawn in, so it never moves; how far
+     * past it a style's size runs is its own ceiling.
+     */
     private static final float SIZE_PROGRESS_MIN_SCALE = 1.45f;
     private static final float SIZE_PROGRESS_MAX_SCALE = 2.45f;
+
+    /**
+     * Where Floating's size stops: the top of the stored range, so the largest size the store
+     * keeps is the largest icon it draws (about 55dp). Past the window's last preset point both
+     * styles' curves run on along their last segment ({@link
+     * AccessoryStackLayoutPolicy#interpolatePresetCurve} extrapolates), so every size inside the
+     * window draws exactly the icon it always did; only the stretch above it is new.
+     */
+    private static final float SIZE_PROGRESS_CEILING =
+        (TermuxPreferenceConstants.TERMUX_APP.MAX_APP_LAUNCHER_BAR_HEIGHT - SIZE_PROGRESS_MIN_SCALE)
+            / (SIZE_PROGRESS_MAX_SCALE - SIZE_PROGRESS_MIN_SCALE);
 
     /**
      * The default (square) dock runs the same slider one notch up the icon curve than the capsule,
      * because its rows carry less padding for the same visual weight.
      */
     private static final float DEFAULT_DOCK_SIZE_PRESET_SHIFT = 0.27f;
-    private static final float DEFAULT_DOCK_SIZE_MAX_PROGRESS = 1.18f;
+    /**
+     * Where Docked's shifted progress stops: a stored 2.56, which draws about the 55-56dp icon
+     * Floating tops out at. Docked's curve climbs about twice as fast per step of the scale, so
+     * running it to the top of the stored range would have drawn a 75dp icon. It was 1.18 (2.36,
+     * a 47dp icon) before the largest size grew.
+     */
+    private static final float DEFAULT_DOCK_SIZE_MAX_PROGRESS = 1.38f;
     private static final float[] DEFAULT_DOCK_ICON_PROGRESS_POINTS = {0.54f, 0.77f, 1.00f, 1.18f};
     private static final float[] DEFAULT_DOCK_ICON_SCALE_POINTS = {
         1.3068f, 1.487604f, 1.68f, 1.89072f
@@ -46,6 +67,26 @@ public final class DockLayoutPolicy {
 
     /** The icon scale used before any preference store exists to read a size preset from. */
     public static final float FALLBACK_ICON_SCALE = 1.36f;
+
+    /**
+     * The shipped height of one extra-keys row, the unit the dock's size curve is measured in.
+     * The activity hands the row's laid-out height over instead once it has one; it is this.
+     */
+    public static final float BASE_TOOLBAR_HEIGHT_DP = 37.5f;
+
+    /** The smallest a pinned icon lying down is ever drawn: a target still worth a thumb. */
+    public static final float MIN_DOCK_ICON_DP = 20f;
+
+    /**
+     * How finely {@link #scaleForIconPx} walks the size scale. The icon moves a pixel at a time
+     * and only wobbles by one where two rounded figures meet, so a walk rather than a bisection;
+     * at this pitch every pixel of the range is visited several times over.
+     */
+    private static final float ICON_SEARCH_STEP_SCALE = 0.001f;
+
+    /** The square dock's legacy row paddings, kept as the icon baseline's (see compute). */
+    private static final float LEGACY_DEFAULT_TOP_PADDING_DP = 6f;
+    private static final float LEGACY_DEFAULT_BOTTOM_PADDING_DP = 3f;
 
     private static final float DOCK_RAIL_MIN_WIDTH_DP = 52f;
     /**
@@ -70,6 +111,14 @@ public final class DockLayoutPolicy {
      * bar with nothing beside it can afford to be.
      */
     public static final float LONE_ROW_AIR_DP = 4f;
+
+    /**
+     * The band a lone row's page ticks stand in, which is also the air it keeps on the side away
+     * from them. The strip's own band ({@link PageTickStrip#BAND_DP}) is the space between two
+     * rows of one sheet; a bar one icon tall spent it twice, above and below its icons, so it keeps
+     * the tick and a sliver either side of it instead.
+     */
+    public static final float LONE_ROW_STRIP_BAND_DP = 6.5f;
 
     /**
      * The air a pinned-apps row sharing its container keeps around its icons, above and below.
@@ -98,10 +147,17 @@ public final class DockLayoutPolicy {
         public final boolean appsOnRail;
         /**
          * The row shares its container with nothing else — the only dock row on the bottom edge, or
-         * the only bar on its plank off the dock, which a rail always is. It is what swaps the
-         * dock's own paddings for {@link #LONE_ROW_AIR_DP}; the icon is the same size either way.
+         * the only bar on its plank off the dock, which a rail always is. It swaps the dock's own
+         * paddings for {@link #LONE_ROW_AIR_DP}, and lets the icon fill the preset's whole
+         * baseline rather than a share of it ({@link #iconPxForScale}).
          */
         public final boolean appsRowAlone;
+        /**
+         * The row is the band next to the canvas, so its ticks take that side. Sharing its
+         * container, the other side then has a band standing beyond it, and keeps the letters'
+         * crown there ({@link #rowAirPx}) instead of the ticks' band.
+         */
+        public final boolean appsRowNextToCanvas;
         /**
          * Whether the row carries the page ticks. The strip is not a band beside the row: it
          * stands in the air the row already keeps on its centre-facing side, so its presence is
@@ -144,6 +200,7 @@ public final class DockLayoutPolicy {
             this.appsRowOnEdge = b.appsRowOnEdge;
             this.appsOnRail = b.appsOnRail;
             this.appsRowAlone = b.appsRowAlone;
+            this.appsRowNextToCanvas = b.appsRowNextToCanvas;
             this.appsRowPageStripShown = b.appsRowPageStripShown;
             this.density = b.density;
             this.barHeightScale = b.barHeightScale;
@@ -170,6 +227,7 @@ public final class DockLayoutPolicy {
             private boolean appsRowOnEdge;
             private boolean appsOnRail;
             private boolean appsRowAlone;
+            private boolean appsRowNextToCanvas;
             // Every row that lies down carries the ticks' band, whether or not it has a second
             // page to show — the band is its air, so a row that gained a page cannot grow by it.
             private boolean appsRowPageStripShown = true;
@@ -197,6 +255,7 @@ public final class DockLayoutPolicy {
             public Builder appsRowOnEdge(boolean v) { this.appsRowOnEdge = v; return this; }
             public Builder appsOnRail(boolean v) { this.appsOnRail = v; return this; }
             public Builder appsRowAlone(boolean v) { this.appsRowAlone = v; return this; }
+            public Builder appsRowNextToCanvas(boolean v) { this.appsRowNextToCanvas = v; return this; }
             public Builder appsRowPageStripShown(boolean v) { this.appsRowPageStripShown = v; return this; }
             public Builder density(float v) { this.density = v; return this; }
             public Builder barHeightScale(float v) { this.barHeightScale = v; return this; }
@@ -247,8 +306,7 @@ public final class DockLayoutPolicy {
         // Vertical paddings. Exactly preserves the previous top (6dp + 7dp*progress) plus a 1dp
         // bottom budget; without a preference store the padding sits at the full-progress value.
         float paddingProgress = in.preferencesAvailable ? sizeProgress : 1f;
-        int capsuleTotalPadding = Math.round((6f + paddingProgress * 7f) * density)
-            + Math.round(density);
+        int capsuleTotalPadding = capsuleTotalPaddingPx(paddingProgress, density);
         out.capsuleAppsTotalPaddingPx = capsuleTotalPadding;
         // Top space equals bottom padding plus the 3dp icon/A-Z indicator band. Together with the
         // paired bottom formula this preserves the old total inset while centering the icon row.
@@ -258,28 +316,26 @@ public final class DockLayoutPolicy {
         out.capsuleAppsBottomPaddingPx =
             Math.max(0, capsuleTotalPadding - out.capsuleAppsTopPaddingPx);
         // 6dp above equals 3dp below plus the fixed 3dp icon/A-Z band.
-        out.defaultAppsTopPaddingPx = Math.round(density * 6f);
-        out.defaultAppsBottomPaddingPx = Math.round(density * 3f);
+        out.defaultAppsTopPaddingPx = Math.round(density * LEGACY_DEFAULT_TOP_PADDING_DP);
+        out.defaultAppsBottomPaddingPx = Math.round(density * LEGACY_DEFAULT_BOTTOM_PADDING_DP);
         // The pair above is the legacy spacing of the dock's three rows on one sheet. It is no
         // longer any row's padding: it survives only as the baseline the icon's size is read out
-        // of, so a given preset draws exactly the icon it always drew.
-        int sharedTopPaddingPx =
-            capsule ? out.capsuleAppsTopPaddingPx : out.defaultAppsTopPaddingPx;
-        int sharedBottomPaddingPx =
-            capsule ? out.capsuleAppsBottomPaddingPx : out.defaultAppsBottomPaddingPx;
+        // of ({@link #iconBaselinePx}), so a given preset draws exactly the icon it always drew in
+        // a shared row, and a lone row exactly the band it always had.
         int loneAirPx = loneRowAirPx(density);
         // The band the page ticks stand in is that side's air, not a band beside it. It used to
         // stack on top of the air, so the icon sat half a strip below the middle of what the two
         // hairlines enclose and the row read bottom-heavy. The strip draws inside the air now and
         // the row is symmetric about its icon on every edge it lies on.
-        int stripBandPx = in.appsRowPageStripShown ? PageTickStrip.bandPx(density) : 0;
+        int stripBandPx = in.appsRowPageStripShown ? stripBandPx(in.appsRowAlone, density) : 0;
         // Sharing, the row keeps the letters' crown on both sides — unless the ticks need more
         // than that, in which case their own band is the air on both sides and the icon sits in
-        // the middle of it. Alone it keeps its sliver on the side without ticks and the strip's
-        // own band on the side with them, and nothing more: a plank of one bar should be as short
-        // as it can be, and there is no second band for it to read symmetric against. The one
-        // place the row's air is decided, whichever edge and form it is in.
-        int airPx = rowAirPx(in.appsRowAlone, in.appsRowPageStripShown, density);
+        // the middle of it. Alone it keeps its sliver while it carries no ticks; with them it
+        // matches their band on the other side too, since a sliver there set the icons hard on
+        // the rim across from the ticks and the row read bottom-heavy. The one place the row's
+        // air is decided, whichever edge and form it is in.
+        int airPx = rowAirPx(in.appsRowAlone, in.appsRowPageStripShown,
+            in.appsRowNextToCanvas, density);
         int tickSideAirPx = rowTickSideAirPx(in.appsRowAlone, in.appsRowPageStripShown, density);
         out.appsRowStripBandPx = stripBandPx;
         out.appsTopPaddingPx = airPx;
@@ -306,22 +362,18 @@ public final class DockLayoutPolicy {
             // and the icon was a fill ratio of what that left, so every dp the preset added was
             // split between the icon and the air around it.
             int iconBaselinePx = in.appsRowEnabledPref
-                ? Math.max(0, presetBaselineBandPx(capsule, sizeProgress, defaultDockProgress,
-                    in.baseToolbarHeightPx, sharedTopPaddingPx, sharedBottomPaddingPx,
-                    density, Math.max(0, in.additionalAppsBarHeightPx))
-                    - sharedTopPaddingPx - sharedBottomPaddingPx)
+                ? iconBaselinePx(capsule, in.barHeightScale, in.baseToolbarHeightPx, density,
+                    in.additionalAppsBarHeightPx)
                 : 0;
-            out.appsRowIconPx = iconBaselinePx <= 0
-                ? 0 : dockIconSizePx(iconBaselinePx, out.iconScale, density);
+            out.appsRowIconPx =
+                rowIconPx(iconBaselinePx, out.iconScale, in.appsRowAlone, density);
             // The band a lying-down apps row claims, whichever edge it lies on: the icon and the
             // air either side of it, and nothing else. The dock's own height is that band while
             // the row is the dock's; a row standing along the top is the same band in another
-            // stack, and the dock collapses to nothing. Alone the row is still formed around the
-            // baseline rather than the icon, so P8's numbers are exactly what they were.
+            // stack, and the dock collapses to nothing. A lone row's icon is the baseline itself
+            // (see rowIconPx), so its band is the height each size has always given it.
             out.appsRowBandPx = iconBaselinePx <= 0
-                ? 0
-                : (in.appsRowAlone ? iconBaselinePx : out.appsRowIconPx)
-                    + airPx + tickSideAirPx;
+                ? 0 : out.appsRowIconPx + airPx + tickSideAirPx;
             // The dock's own row view is the band less the strip's share of it: the ticks stand
             // in the host beside the pager rather than inside it, and between them they are the
             // band. Nothing is reserved for the strip on top of the air.
@@ -333,8 +385,7 @@ public final class DockLayoutPolicy {
                 azRowEnabled, in.rowOverAz, density);
             out.azRowChinPaddingPx = AccessoryStackLayoutPolicy.computeAzRowChinPaddingPx(
                 azRowEnabled, in.rowUnderAz, density);
-            out.indicatorBandHeightPx = AccessoryStackLayoutPolicy.computePageIndicatorBandHeightPx(
-                appsRowEnabled && in.appsRowPageStripShown, density);
+            out.indicatorBandHeightPx = appsRowEnabled ? stripBandPx : 0;
             out.interRowGapPx = out.indicatorBandHeightPx;
         }
         // The box the icon is centred in: the band less the air on each side of it. Taken off the
@@ -403,12 +454,27 @@ public final class DockLayoutPolicy {
      * {@link #rowTickSideAirPx}, so the row is symmetric about its icon and the icon sits in the
      * middle of what the two hairlines around it enclose.
      *
-     * <p>A row standing alone has no such pair to read against: it keeps its sliver here whether
-     * or not it carries ticks, and the strip's band is all the air on the other side. The plank is
-     * then the icon and as little as the two sides can be.
+     * <p>A row standing alone keeps its sliver while it carries no ticks, so a plank of one bar is
+     * the icon and as little as it can be. With ticks it matches their band here too: the sliver
+     * alone set the icons against the rim across from the strip, and the row read bottom-heavy.
+     * That band is the lone one ({@link #LONE_ROW_STRIP_BAND_DP}), a size down from the strip's.
      */
     public static int rowAirPx(boolean alone, boolean pageStripShown, float density) {
-        if (alone) return loneRowAirPx(density);
+        return rowAirPx(alone, pageStripShown, false, density);
+    }
+
+    /**
+     * As {@link #rowAirPx(boolean, boolean, float)}, for a row that may be the band next to the
+     * canvas. Sharing its container there, its ticks stand on the canvas side and a band stands
+     * beyond the other, so that side keeps the letters' crown: the ticks' band there opened a hole
+     * between the icons and the band under them. The side facing a band over the row is not
+     * touched, which is what keeps the icon centred when the ticks stand under it.
+     */
+    public static int rowAirPx(boolean alone, boolean pageStripShown, boolean nextToCanvas,
+                               float density) {
+        if (!alone && nextToCanvas) return sharedRowAirPx(density);
+        if (alone) return Math.max(loneRowAirPx(density),
+            pageStripShown ? stripBandPx(true, density) : 0);
         return Math.max(sharedRowAirPx(density),
             pageStripShown ? PageTickStrip.bandPx(density) : 0);
     }
@@ -421,7 +487,28 @@ public final class DockLayoutPolicy {
      */
     public static int rowTickSideAirPx(boolean alone, boolean pageStripShown, float density) {
         int base = alone ? loneRowAirPx(density) : sharedRowAirPx(density);
-        return Math.max(base, pageStripShown ? PageTickStrip.bandPx(density) : 0);
+        return Math.max(base, pageStripShown ? stripBandPx(alone, density) : 0);
+    }
+
+    /**
+     * The band a lying-down row's page ticks stand in: the strip's own while the row shares its
+     * container, {@link #LONE_ROW_STRIP_BAND_DP} while it stands alone.
+     */
+    public static int stripBandPx(boolean alone, float density) {
+        return alone ? Math.round(Math.max(0f, density) * LONE_ROW_STRIP_BAND_DP)
+            : PageTickStrip.bandPx(density);
+    }
+
+    /**
+     * The pinned icon a row lying down draws from its preset's baseline. Sharing its container the
+     * row's band is formed around the icon, a fill ratio of the baseline. Alone, the band is the
+     * baseline itself, the height every size has always given a lone bar, and the icon fills it:
+     * a fill ratio there left a tall bar around a small icon. Width still has the last word
+     * ({@link #slotFitIconPx}).
+     */
+    private static int rowIconPx(int baselinePx, float iconScale, boolean alone, float density) {
+        if (baselinePx <= 0) return 0;
+        return alone ? baselinePx : dockIconSizePx(baselinePx, iconScale, density);
     }
 
     /**
@@ -434,12 +521,37 @@ public final class DockLayoutPolicy {
      */
     public static int dockIconSizePx(int rowContentHeightPx, float iconScale, float density) {
         float safeDensity = Math.max(0f, density);
-        int minPx = Math.round(safeDensity * 20f);
+        int minPx = minRowContentPx(safeDensity);
         int usablePx = Math.max(Math.round(safeDensity * 24f),
             rowContentHeightPx - Math.round(safeDensity * 2f));
         int candidate = Math.round(
             usablePx * AccessoryStackLayoutPolicy.computeDockIconFillRatio(iconScale));
         return Math.max(minPx, Math.min(Math.max(minPx, usablePx), candidate));
+    }
+
+    /**
+     * One pinned icon lying down, held to the slot it stands in. The row shares its width evenly
+     * between its slots, so an icon wider than its share would cover the icons beside it: ten
+     * apps on a 360dp phone are 36dp slots, under the 40dp the shipped size draws. The icon keeps
+     * the lone row's air ({@link #LONE_ROW_AIR_DP}, the least air a pinned row keeps around its
+     * icons) from its neighbours, so a full row still reads as separate icons. Wherever the
+     * size's icon fits with that air it is unchanged; a row with no width yet is not held at all.
+     */
+    public static int slotFitIconPx(int iconPx, int rowWidthPx, int slotCount, float density) {
+        if (iconPx <= 0 || rowWidthPx <= 0)
+            return iconPx;
+        int slotPx = rowWidthPx / Math.max(1, slotCount);
+        return Math.max(1, Math.min(iconPx, slotPx - loneRowAirPx(density)));
+    }
+
+    /**
+     * The shortest box a pinned-apps row lying down is ever handed: its smallest icon,
+     * {@link #MIN_DOCK_ICON_DP}. The row's box is its icon, so a row that asks for more than this
+     * before it renders refuses sizes the dock really gives it — Docked sharing its container at
+     * the bottom of the size stretch is a 21dp box.
+     */
+    public static int minRowContentPx(float density) {
+        return Math.round(Math.max(0f, density) * MIN_DOCK_ICON_DP);
     }
 
     /** One rail icon's size, the same on every side and independent of the dock's size preset. */
@@ -480,6 +592,130 @@ public final class DockLayoutPolicy {
     }
 
     /**
+     * The pinned icon a stored dock size draws, lying down, with no tuning drag on top: exactly
+     * the {@link DockLayout#appsRowIconPx} {@link #compute} gives for that scale and the same
+     * {@code alone} ({@link DockInputs#appsRowAlone}). The dock's band is this icon and its air, so
+     * it is the one figure the size control moves. A lone row's icon is the larger of the two at
+     * every size, since it fills the band a shared row only takes a share of.
+     */
+    public static int iconPxForScale(boolean capsule, boolean alone, float barHeightScale,
+                                     int baseToolbarHeightPx, float density) {
+        int baselinePx = iconBaselinePx(capsule, barHeightScale, baseToolbarHeightPx, density, 0);
+        return rowIconPx(baselinePx,
+            iconScaleFor(capsule, styleProgress(capsule, barHeightScale)), alone, density);
+    }
+
+    /**
+     * As {@link #iconPxForScale(boolean, boolean, float, int, float)} on the shipped extra-keys
+     * row.
+     */
+    public static int iconPxForScale(boolean capsule, boolean alone, float barHeightScale,
+                                     float density) {
+        return iconPxForScale(capsule, alone, barHeightScale, baseToolbarHeightPx(density),
+            density);
+    }
+
+    /** {@link #BASE_TOOLBAR_HEIGHT_DP} in pixels. */
+    public static int baseToolbarHeightPx(float density) {
+        return Math.round(Math.max(0f, density) * BASE_TOOLBAR_HEIGHT_DP);
+    }
+
+    /**
+     * The lowest stored dock size the icon still answers to. Below it the size curve's progress
+     * is pinned at zero, so the icon — and the band, which is formed around it — stand still.
+     */
+    public static float minUsefulScale() {
+        return SIZE_PROGRESS_MIN_SCALE;
+    }
+
+    /**
+     * The highest stored dock size the icon still answers to, per style. Floating's curve runs to
+     * the top of the stored range; Docked's runs one notch ahead of it and reaches its own cap
+     * first, so its last stretch is a dead band unless the controls stop here.
+     */
+    public static float maxUsefulScale(boolean capsule) {
+        float progress = capsule
+            ? SIZE_PROGRESS_CEILING
+            : DEFAULT_DOCK_SIZE_MAX_PROGRESS - DEFAULT_DOCK_SIZE_PRESET_SHIFT;
+        return SIZE_PROGRESS_MIN_SCALE
+            + progress * (SIZE_PROGRESS_MAX_SCALE - SIZE_PROGRESS_MIN_SCALE);
+    }
+
+    /** A stored dock size held to the stretch where the icon follows it. */
+    public static float clampToUsefulScale(boolean capsule, float barHeightScale) {
+        return Math.max(minUsefulScale(), Math.min(maxUsefulScale(capsule), barHeightScale));
+    }
+
+    /**
+     * The stored dock size that draws an icon of {@code iconPx}, or the nearest one the curve
+     * reaches: the inverse of {@link #iconPxForScale}, always inside the useful stretch. A shipped
+     * preset that draws that icon is the answer before anything else, so a control brought back
+     * to a preset's icon stores the preset itself; otherwise the smallest scale that draws it.
+     */
+    public static float scaleForIconPx(boolean capsule, boolean alone, int iconPx,
+                                       int baseToolbarHeightPx, float density) {
+        float min = minUsefulScale();
+        float max = maxUsefulScale(capsule);
+        for (float preset : SIZE_PRESETS) {
+            if (preset >= min && preset <= max
+                && iconPxForScale(capsule, alone, preset, baseToolbarHeightPx, density) == iconPx)
+                return preset;
+        }
+        int steps = Math.max(1, Math.round((max - min) / ICON_SEARCH_STEP_SCALE));
+        float best = min;
+        int bestDiff = Integer.MAX_VALUE;
+        for (int i = 0; i <= steps; i++) {
+            float scale = min + (max - min) * i / steps;
+            int diff = Math.abs(
+                iconPxForScale(capsule, alone, scale, baseToolbarHeightPx, density) - iconPx);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = scale;
+                if (diff == 0) break;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * As {@link #scaleForIconPx(boolean, boolean, int, int, float)} on the shipped extra-keys
+     * row.
+     */
+    public static float scaleForIconPx(boolean capsule, boolean alone, int iconPx,
+                                       float density) {
+        return scaleForIconPx(capsule, alone, iconPx, baseToolbarHeightPx(density), density);
+    }
+
+    /** The progress a style's icon curve reads: its own window, or Docked's shifted one. */
+    private static float styleProgress(boolean capsule, float barHeightScale) {
+        return capsule ? sizeProgress(barHeightScale) : defaultDockSizeProgress(barHeightScale);
+    }
+
+    /**
+     * The row content an icon is a fill ratio of, for a stored size: the preset's baseline band
+     * less the legacy paddings. A lone row's icon is all of it ({@link #rowIconPx}). Shared by
+     * {@link #compute} and {@link #iconPxForScale} so the dock and its size control can never
+     * disagree about the icon.
+     */
+    private static int iconBaselinePx(boolean capsule, float barHeightScale,
+                                      int baseToolbarHeightPx, float density,
+                                      int additionalAppsBarHeightPx) {
+        float sizeProgress = sizeProgress(barHeightScale);
+        int paddingPx = capsule
+            ? capsuleTotalPaddingPx(sizeProgress, density)
+            : Math.round(density * LEGACY_DEFAULT_TOP_PADDING_DP)
+                + Math.round(density * LEGACY_DEFAULT_BOTTOM_PADDING_DP);
+        return Math.max(0, presetBaselineBandPx(capsule, sizeProgress,
+            defaultDockSizeProgress(barHeightScale), baseToolbarHeightPx, paddingPx, density,
+            Math.max(0, additionalAppsBarHeightPx)) - paddingPx);
+    }
+
+    /** The capsule's legacy row paddings, top and bottom together, at a size progress. */
+    private static int capsuleTotalPaddingPx(float progress, float density) {
+        return Math.round((6f + progress * 7f) * density) + Math.round(density);
+    }
+
+    /**
      * The preset's baseline row height — the extra-keys row scaled, then grown enough for the icon
      * curve. It is not the row's band any more (that is the icon and its air): the caller takes the
      * legacy paddings back off it and sizes the icon from what is left, which is the one thing this
@@ -487,13 +723,12 @@ public final class DockLayoutPolicy {
      */
     private static int presetBaselineBandPx(boolean capsule, float sizeProgress,
                                            float defaultDockProgress, int baseToolbarHeightPx,
-                                           int appsTopPaddingPx, int appsBottomPaddingPx,
-                                           float density, int additionalAppsBarHeightPx) {
+                                           int verticalPaddingPx, float density,
+                                           int additionalAppsBarHeightPx) {
         float baselineHeightFactor = capsule
             ? (1.12f + (sizeProgress * 0.60f))
             : (1.00f + (defaultDockProgress * 0.52f));
         int baselineRowHeightPx = Math.round(baseToolbarHeightPx * baselineHeightFactor);
-        int verticalPaddingPx = appsTopPaddingPx + appsBottomPaddingPx;
         int twoDpPx = Math.round(density * 2f);
         int minUsablePx = Math.round(density * 24f);
         int baselineHintPx = Math.max(0, baselineRowHeightPx - verticalPaddingPx);
@@ -572,10 +807,14 @@ public final class DockLayoutPolicy {
         return Math.round(basePx + encroachmentPx);
     }
 
-    /** The stored size preset normalized into 0..1. */
+    /**
+     * The stored size preset normalized into the preset window, 0..1 inside it and on up to
+     * {@link #SIZE_PROGRESS_CEILING} above it.
+     */
     public static float sizeProgress(float barHeightScale) {
-        return Math.max(0f, Math.min(1f, (barHeightScale - SIZE_PROGRESS_MIN_SCALE)
-            / (SIZE_PROGRESS_MAX_SCALE - SIZE_PROGRESS_MIN_SCALE)));
+        return Math.max(0f, Math.min(SIZE_PROGRESS_CEILING,
+            (barHeightScale - SIZE_PROGRESS_MIN_SCALE)
+                / (SIZE_PROGRESS_MAX_SCALE - SIZE_PROGRESS_MIN_SCALE)));
     }
 
     /** The default dock's shifted progress, which runs one preset notch above the capsule's. */

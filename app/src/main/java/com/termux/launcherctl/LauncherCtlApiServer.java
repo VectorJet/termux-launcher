@@ -8,6 +8,7 @@ import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 
 import com.termux.ai.TaiApiCompatibility;
 import com.termux.ai.TaiCliFormatter;
+import com.termux.ai.TaiEventLog;
 import com.termux.ai.TaiManager;
 import com.termux.ai.TaiSettings;
 import com.termux.app.launcher.LauncherAppLauncher;
@@ -48,11 +49,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -91,6 +94,18 @@ public class LauncherCtlApiServer {
         thread.setDaemon(true);
         return thread;
     });
+    /**
+     * {@code POST /v1/panes/{id}/wait}, which may hold its connection for minutes. The request
+     * pool above has two threads until 64 requests are queued, so a wait parked on one of them
+     * would halve the server and two would stall it; a wait is handed to a thread of its own here
+     * instead, at most {@link PaneWait#MAX_CONCURRENT} at once, and one more is refused with 429.
+     */
+    private final ThreadPoolExecutor paneWaitExecutor = new ThreadPoolExecutor(
+        0, PaneWait.MAX_CONCURRENT, 30L, TimeUnit.SECONDS, new SynchronousQueue<>(), runnable -> {
+            Thread thread = new Thread(runnable, "launcherctl-pane-wait");
+            thread.setDaemon(true);
+            return thread;
+        });
     private final SecureRandom random = new SecureRandom();
     private final Map<String, SimpleRateLimiter> rateLimiters = new HashMap<>();
 
@@ -255,6 +270,7 @@ public class LauncherCtlApiServer {
         stopListening();
         clientExecutor.shutdownNow();
         controlExecutor.shutdownNow();
+        paneWaitExecutor.shutdownNow();
     }
 
     /** Closes the socket and ends the accept loop; the executors stay up for a restart. */
@@ -319,10 +335,13 @@ public class LauncherCtlApiServer {
     }
 
     private void handleClient(Socket socket, Context context) {
-        try (Socket client = socket;
-             BufferedInputStream input = new BufferedInputStream(client.getInputStream());
-             OutputStream output = client.getOutputStream()) {
-            client.setSoTimeout(CLIENT_SOCKET_TIMEOUT_MS);
+        String route = null;
+        // A pane wait answers from its own thread, which then owns (and closes) the socket.
+        boolean handedOff = false;
+        try {
+            BufferedInputStream input = new BufferedInputStream(socket.getInputStream());
+            OutputStream output = socket.getOutputStream();
+            socket.setSoTimeout(CLIENT_SOCKET_TIMEOUT_MS);
 
             HttpRequest request;
             try {
@@ -331,6 +350,7 @@ public class LauncherCtlApiServer {
                 writeJsonResponse(output, e.statusCode, jsonError(e.errorCode, e.getMessage()).toString());
                 return;
             }
+            route = request.method + " " + request.path;
 
             if (lanSessionDeadlineMs > 0 && System.currentTimeMillis() > lanSessionDeadlineMs) {
                 beginLanSessionExpiry();
@@ -386,11 +406,51 @@ public class LauncherCtlApiServer {
                 return;
             }
 
+            if (isPaneWaitRoute(request.method, request.path)) {
+                handedOff = startPaneWait(context, socket, output, request, origin);
+                return;
+            }
+
             HttpResponse response = routeRequest(context, request);
             writeResponse(output, response, origin);
 
         } catch (Exception e) {
             Logger.logErrorExtended(LOG_TAG, "Request handling failed: " + e.getMessage());
+            // Only the AI routes feed the AI event log; the line carries the path, never the body.
+            if (route != null && (route.contains(" /v1/ai/") || route.contains(" /v1/chat/")
+                    || route.contains(" /v1/audio/"))) {
+                TaiEventLog.log(context, TaiEventLog.API_ERROR,
+                    route + ": " + e.getClass().getSimpleName() + " " + e.getMessage());
+            }
+        } finally {
+            if (!handedOff) closeQuietly(socket);
+        }
+    }
+
+    /**
+     * Hands {@code POST /v1/panes/{id}/wait} to {@link #paneWaitExecutor}, whose thread answers it
+     * and closes the socket; true when it took the request. When every wait thread is busy the
+     * caller is told so with 429 right here, and false leaves the socket to this thread.
+     */
+    private boolean startPaneWait(Context context, Socket socket, OutputStream output,
+                                  HttpRequest request, String origin) throws IOException, JSONException {
+        try {
+            paneWaitExecutor.execute(() -> {
+                try {
+                    writeResponse(output, jsonResponse(runPaneWait(context, request)), origin);
+                } catch (Exception e) {
+                    Logger.logErrorExtended(LOG_TAG, "Pane wait failed: " + e.getMessage());
+                } finally {
+                    closeQuietly(socket);
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException busy) {
+            JSONObject error = jsonError("too_many_waits", PaneWait.MAX_CONCURRENT
+                + " waits are already running; retry when one of them has answered");
+            error.put("_statusCode", 429);
+            writeResponse(output, jsonResponse(error), origin);
+            return false;
         }
     }
 
@@ -496,7 +556,7 @@ public class LauncherCtlApiServer {
 
     private static HttpResponse corsPreflightResponse() {
         Map<String, String> headers = new HashMap<>();
-        headers.put("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
+        headers.put("Access-Control-Allow-Methods", "GET, POST, DELETE, HEAD, OPTIONS");
         headers.put("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, X-Tai-Output, OpenAI-Beta");
         headers.put("Access-Control-Max-Age", "86400");
         return new HttpResponse(200, "text/plain; charset=utf-8", new byte[0], headers);
@@ -546,15 +606,29 @@ public class LauncherCtlApiServer {
             } else if ("POST".equals(request.method) && "/v1/agents/hooks".equals(request.path)) {
                 return jsonResponse(installAgentHooks());
             } else if (request.path.startsWith("/v1/panes")) {
-                if (!TermuxAppSharedPreferences.build(context).isAgentPanesEnabled()) {
-                    JSONObject error = jsonError("panes_api_disabled",
-                        "Pane access for scripts is switched off in Settings > Terminal & Status > Sessions and panes");
-                    error.put("_statusCode", 403);
-                    return jsonResponse(error);
-                }
-                return jsonResponse(runPaneRequest(request));
+                JSONObject refusal = panesApiRefusal(context);
+                if (refusal != null) return jsonResponse(refusal);
+                return openedResponse(request, runPaneRequest(request));
+            } else if (("POST".equals(request.method) && "/v1/windows".equals(request.path))
+                    || request.path.startsWith("/v1/windows/")) {
+                JSONObject refusal = panesApiRefusal(context);
+                if (refusal != null) return jsonResponse(refusal);
+                if ("/v1/windows".equals(request.path)) return openedResponse(request, runWindowOpenRequest(request));
+                return jsonResponse(runWindowRequest(request));
             } else if (request.path.startsWith("/v1/keyboard/")) {
                 return jsonResponse(runKeyboardRequest(request));
+            } else if (LauncherCtlNotificationRoutes.handles(request.method, request.path)) {
+                LauncherCtlNotificationRoutes.Result result = LauncherCtlNotificationRoutes.handle(
+                    context, request.method, request.path, queryParameters(request.query), request.body);
+                if (result.text != null) {
+                    return new HttpResponse(200, "text/plain; charset=utf-8",
+                        result.text.getBytes(StandardCharsets.UTF_8), null);
+                }
+                return jsonResponse(result.json);
+            } else if (signalToolFor(request.method, request.path) != null) {
+                return jsonResponse(runSignalRequest(request));
+            } else if (DeviceControlRoutes.handles(request.method, request.path)) {
+                return jsonResponse(DeviceControlRoutes.handle(context, request.method, request.path, request.body));
             } else if ("GET".equals(request.method) && "/v1/x11/gpu".equals(request.path)) {
                 // Off the request thread's main-thread worries already: this is the server's own
                 // worker, and the probe builds a throwaway GL context the first time.
@@ -570,6 +644,9 @@ public class LauncherCtlApiServer {
                 return maybeTextResponse(request, "status", TaiManager.getInstance(context).status());
             } else if ("GET".equals(request.method) && "/v1/ai/runtime".equals(request.path)) {
                 return maybeTextResponse(request, "runtime", TaiManager.getInstance(context).runtimeStatus());
+            } else if ("POST".equals(request.method) && "/v1/ai/tier".equals(request.path)) {
+                // tai runtime --tier 1|2|3|auto: the developer override of the RAM tier.
+                return jsonResponse(setTierOverride(context, request.body));
             } else if ("GET".equals(request.method) && "/v1/ai/models".equals(request.path)) {
                 return maybeTextResponse(request, "models", TaiManager.getInstance(context).models());
             } else if ("POST".equals(request.method) && "/v1/ai/models/import".equals(request.path)) {
@@ -583,6 +660,12 @@ public class LauncherCtlApiServer {
                 return maybeTextResponse(request, "downloads", TaiManager.getInstance(context).downloads());
             } else if ("POST".equals(request.method) && "/v1/ai/models/downloads/cancel".equals(request.path)) {
                 return maybeTextResponse(request, "download", TaiManager.getInstance(context).cancelDownload(request.body));
+            } else if ("POST".equals(request.method) && "/v1/ai/models/downloads/pause".equals(request.path)) {
+                return maybeTextResponse(request, "download", TaiManager.getInstance(context).pauseDownload(request.body));
+            } else if ("POST".equals(request.method) && "/v1/ai/models/downloads/resume".equals(request.path)) {
+                return maybeTextResponse(request, "download", TaiManager.getInstance(context).resumeDownload(request.body));
+            } else if ("POST".equals(request.method) && "/v1/ai/models/downloads/prioritize".equals(request.path)) {
+                return maybeTextResponse(request, "download", TaiManager.getInstance(context).prioritizeDownload(request.body));
             } else if ("POST".equals(request.method) && "/v1/ai/models/delete".equals(request.path)) {
                 return maybeTextResponse(request, "delete", TaiManager.getInstance(context).deleteModel(request.body));
             } else if ("POST".equals(request.method) && "/v1/ai/models/load".equals(request.path)) {
@@ -597,8 +680,41 @@ public class LauncherCtlApiServer {
                 return maybeTextResponse(request, "unload", TaiManager.getInstance(context).unloadModel());
             } else if ("POST".equals(request.method) && "/v1/ai/runtime/keep-warm".equals(request.path)) {
                 return maybeTextResponse(request, "keep-warm", TaiManager.getInstance(context).keepWarmRuntime(request.body));
+            } else if ("POST".equals(request.method) && "/v1/ai/runtime/benchmark".equals(request.path)) {
+                // LiteRT-LM's own benchmark(): tai benchmark --native, kept for comparing numbers.
+                return maybeTextResponse(request, "benchmark", TaiManager.getInstance(context).benchmark(request.body));
+            } else if ("POST".equals(request.method) && "/v1/ai/benchmarks/run".equals(request.path)) {
+                // Bench v1. With stream:true the harness's events go out as they happen — SSE, or
+                // one plain line per phase when the CLI asks for text; otherwise the run's summary.
+                TaiManager manager = TaiManager.getInstance(context);
+                if (manager.isStreamRequest(request.body)) {
+                    if ("text".equalsIgnoreCase(request.headers.get("x-tai-output"))) {
+                        return textStreamResponse(output -> writeBenchTextStream(context, request.body, output));
+                    }
+                    return sseResponse(output -> writeBenchStream(context, request.body, output));
+                }
+                return maybeTextResponse(request, "benchmark-run", manager.benchRunCollect(request.body));
+            } else if ("GET".equals(request.method) && "/v1/ai/benchmarks".equals(request.path)) {
+                return maybeTextResponse(request, "benchmarks", TaiManager.getInstance(context).benchmarks());
+            } else if ("DELETE".equals(request.method) && "/v1/ai/benchmarks".equals(request.path)) {
+                return maybeTextResponse(request, "benchmarks-clear", TaiManager.getInstance(context).clearBenchmarks(request.body));
+            } else if ("DELETE".equals(request.method) && "/v1/ai/runtime/history".equals(request.path)) {
+                return maybeTextResponse(request, "history-clear", TaiManager.getInstance(context).clearRuntimeHistory());
+            } else if ("GET".equals(request.method) && "/v1/ai/logs".equals(request.path)) {
+                int lines = TaiEventLog.DEFAULT_TAIL_LINES;
+                try {
+                    String requested = queryParameters(request.query).get("lines");
+                    if (requested != null) lines = Math.max(1, Math.min(5000, Integer.parseInt(requested.trim())));
+                } catch (NumberFormatException ignored) {
+                }
+                return maybeTextResponse(request, "logs", TaiManager.getInstance(context).eventLogs(lines));
+            } else if ("DELETE".equals(request.method) && "/v1/ai/logs".equals(request.path)) {
+                return maybeTextResponse(request, "logs-clear", TaiManager.getInstance(context).clearEventLogs());
             } else if ("POST".equals(request.method) && "/v1/ai/runtime/cancel".equals(request.path)) {
                 return maybeTextResponse(request, "cancel", TaiManager.getInstance(context).cancelRuntime());
+            } else if ("POST".equals(request.method) && "/v1/ai/benchmarks/skip-wait".equals(request.path)) {
+                // "Skip the wait" (spec Screen 5): ends the active bench's cool-down at once.
+                return maybeTextResponse(request, "skip-wait", TaiManager.getInstance(context).skipBenchCooldown());
             } else if ("GET".equals(request.method) && "/v1/models".equals(request.path)) {
                 return jsonResponse(TaiManager.getInstance(context).openAiModels());
             } else if ("GET".equals(request.method) && isModelRetrievePath(request.path)) {
@@ -624,8 +740,21 @@ public class LauncherCtlApiServer {
                 return jsonResponse(TaiManager.getInstance(context).openAiCompletions(request.body));
             } else if ("POST".equals(request.method) && "/v1/embeddings".equals(request.path)) {
                 return jsonResponse(TaiManager.getInstance(context).embeddings(request.body));
+            } else if ("POST".equals(request.method) && "/v1/tokenize".equals(request.path)) {
+                return jsonResponse(TaiManager.getInstance(context).tokenize(request.body));
+            } else if ("POST".equals(request.method) && "/v1/audio/transcriptions".equals(request.path)) {
+                return audioTranscriptions(context, request);
             } else if ("POST".equals(request.method) && "/v1/audio/speech".equals(request.path)) {
-                return jsonResponse(TaiManager.getInstance(context).openAiAudioSpeech(request.body));
+                String body = request.body == null || request.body.trim().isEmpty() ? "{}" : request.body;
+                return audioSpeech(context, body, TaiManager.apiSpeechCharacterLimit());
+            } else if ("POST".equals(request.method) && "/v1/ai/speak".equals(request.path)) {
+                return aiSpeak(context, request);
+            } else if ("POST".equals(request.method) && "/v1/ai/speak/stop".equals(request.path)) {
+                return maybeTextResponse(request, "speak-stop", TaiManager.getInstance(context).stopSpeaking());
+            } else if ("POST".equals(request.method) && "/v1/ai/images/generations".equals(request.path)) {
+                return imageGenerations(context, request);
+            } else if ("POST".equals(request.method) && "/v1/ai/images/cancel".equals(request.path)) {
+                return maybeTextResponse(request, "image-cancel", TaiManager.getInstance(context).cancelImage());
             }
 
             JSONObject notFound = jsonError("not_found", "Unknown endpoint");
@@ -671,6 +800,324 @@ public class LauncherCtlApiServer {
     }
 
     /**
+     * OpenAI POST /v1/audio/speech: {@code {model, input, voice, speed, response_format}} in, audio
+     * out. {@code wav} (the default here; OpenAI's mp3/opus/aac/flac are refused rather than
+     * answered with something else) is sent once synthesis is done, since a RIFF header carries the
+     * length; {@code pcm} (24 kHz, 16-bit signed little-endian mono, OpenAI's shape) is
+     * streamed sentence by sentence, so a client can start playing after the first sentence. The
+     * request is checked before anything is committed to, and the model loaded first for pcm, so a
+     * refusal or a model that cannot load still answers with its own status.
+     */
+    private HttpResponse audioSpeech(Context context, String body, int maxChars) throws JSONException {
+        TaiManager manager = TaiManager.getInstance(context);
+        JSONObject refusal = manager.checkSpeechRequest(body, maxChars);
+        if (refusal != null) return jsonResponse(refusal);
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Cache-Control", "no-cache");
+        headers.put("X-Tai-Sample-Rate", "24000");
+        if ("pcm".equals(TaiManager.speechResponseFormat(body))) {
+            JSONObject warm = manager.ttsWarm(body);
+            if (isSpeechFailure(warm)) return jsonResponse(speechFailure(warm));
+            headers.put("X-Accel-Buffering", "no");
+            return new HttpResponse(200, "audio/pcm", output -> {
+                try {
+                    manager.synthesizeSpeech(body, maxChars, (pcm, sampleRate) -> {
+                        output.write(pcm);
+                        output.flush();
+                    });
+                } catch (JSONException e) {
+                    throw new IOException(e.getMessage(), e);
+                }
+            }, headers);
+        }
+        // WAV needs its length up front, so the sentences are collected first — into a file under
+        // cacheDir/tai-ipc rather than memory, since this is the launcher process and a long text
+        // is minutes of audio — and the file then streams out behind its header.
+        File dir = new File(context.getCacheDir(), TaiManager.STT_IPC_DIR);
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            return jsonResponse(statusError(500, "tts_output_failed", "Could not create " + dir));
+        }
+        File collected = new File(dir, "tts-out-" + UUID.randomUUID() + ".pcm");
+        final int[] rate = {24000};
+        JSONObject result;
+        try (FileOutputStream sink = new FileOutputStream(collected)) {
+            result = manager.synthesizeSpeech(body, maxChars, (bytes, sampleRate) -> {
+                rate[0] = sampleRate;
+                sink.write(bytes);
+            });
+        } catch (IOException e) {
+            deleteQuietly(collected);
+            return jsonResponse(statusError(500, "tts_output_failed", "Speech could not be collected: " + e.getMessage()));
+        } catch (JSONException | RuntimeException e) {
+            deleteQuietly(collected);
+            throw e;
+        }
+        if (isSpeechFailure(result)) {
+            deleteQuietly(collected);
+            return jsonResponse(speechFailure(result));
+        }
+        long dataBytes = collected.length();
+        headers.put("Content-Length", Long.toString(TaiManager.wavHeader(0, rate[0]).length + dataBytes));
+        return new HttpResponse(200, "audio/wav", output -> {
+            try (InputStream in = new java.io.FileInputStream(collected)) {
+                output.write(TaiManager.wavHeader((int) Math.min(Integer.MAX_VALUE, dataBytes), rate[0]));
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = in.read(buffer)) != -1) output.write(buffer, 0, read);
+            } finally {
+                deleteQuietly(collected);
+            }
+        }, headers);
+    }
+
+    /**
+     * POST /v1/ai/images/generations (OpenAI-shaped): {@code {model | model_path, prompt, size, n, steps,
+     * seed, cfg_scale, image, backend, memory_mode, output, stream}} in, {@code {created, data:[{b64_json |
+     * path}], tai:{...timings}}} out. The request is checked before anything is committed to, so a
+     * refusal answers with its own status even when {@code stream} is set. With {@code stream} the
+     * progress goes out as SSE events (or as plain {@code progress N} lines for the CLI's text mode),
+     * then the final object. A generation takes seconds to minutes and the engine cannot be stopped
+     * part-way; a client that goes away has its result discarded.
+     */
+    private HttpResponse imageGenerations(Context context, HttpRequest request) throws JSONException {
+        String body = request.body == null || request.body.trim().isEmpty() ? "{}" : request.body;
+        TaiManager manager = TaiManager.getInstance(context);
+        JSONObject refusal = manager.checkImageRequest(body);
+        if (refusal != null) return jsonResponse(refusal);
+        boolean stream = new JSONObject(body).optBoolean("stream", false);
+        if (stream && "text".equalsIgnoreCase(request.headers.get("x-tai-output"))) {
+            return textStreamResponse(output -> writeImageTextStream(manager, body, output));
+        }
+        if (stream) return sseResponse(output -> writeImageSseStream(manager, body, output));
+        try {
+            return jsonResponse(manager.generateImage(body, percent -> { }));
+        } catch (IOException e) {
+            return jsonResponse(jsonError("internal_error", e.getMessage() == null ? "" : e.getMessage()));
+        }
+    }
+
+    private void writeImageSseStream(TaiManager manager, String body, OutputStream output) throws IOException {
+        try {
+            JSONObject result = manager.generateImage(body, percent -> {
+                try {
+                    writeSseEvent(output, new JSONObject().put("type", "image_generation.progress")
+                        .put("progress", percent).toString());
+                } catch (JSONException e) {
+                    throw new IOException(e.getMessage(), e);
+                }
+            });
+            if (result.has("error")) {
+                writeSseEvent(output, result.toString());
+            } else {
+                result.put("type", "image_generation.completed");
+                writeSseEvent(output, result.toString());
+            }
+        } catch (JSONException e) {
+            writeSseJsonError(output, "internal_error", e.getMessage());
+        }
+        writeSseEvent(output, "[DONE]");
+    }
+
+    /** The lines {@code tai image} reads: {@code progress N}, then {@code done PATH} and {@code info JSON}, or {@code error TEXT}. */
+    private void writeImageTextStream(TaiManager manager, String body, OutputStream output) throws IOException {
+        try {
+            JSONObject result = manager.generateImage(body, percent -> writeTextLine(output, TaiCliFormatter.imageProgressLine(percent)));
+            writeTextLine(output, result.has("error") ? TaiCliFormatter.imageErrorLine(result)
+                : TaiCliFormatter.imageDoneLines(result));
+        } catch (JSONException e) {
+            writeTextLine(output, TaiCliFormatter.imageErrorLine(jsonError("internal_error", e.getMessage() == null ? "" : e.getMessage())));
+        }
+    }
+
+    private void writeTextLine(OutputStream output, String text) throws IOException {
+        output.write(text.getBytes(StandardCharsets.UTF_8));
+        output.flush();
+    }
+
+    /**
+     * {@code tai speak}: POST /v1/ai/speak plays the text on the phone and answers when it has been
+     * heard. The body is JSON ({@code input}, {@code voice}, {@code speed}, {@code model}) or plain
+     * text with those as query parameters, which is what the script sends so it never has to
+     * escape the text into JSON. With {@code response_format} ({@code ?format=wav}) it returns the
+     * audio instead of playing it, the same as /v1/audio/speech with {@code tai speak}'s longer
+     * text limit: that is {@code tai speak --out}.
+     */
+    private HttpResponse aiSpeak(Context context, HttpRequest request) throws JSONException {
+        JSONObject body = speakBody(request);
+        if (body.has("response_format")) {
+            return audioSpeech(context, body.toString(), TaiManager.speakCharacterLimit());
+        }
+        JSONObject result = TaiManager.getInstance(context).speak(body.toString());
+        if (isSpeechFailure(result) && "text".equalsIgnoreCase(request.headers.get("x-tai-output"))) {
+            JSONObject nested = result.optJSONObject("error");
+            if (nested != null) {
+                JSONObject flat = new JSONObject();
+                flat.put("ok", false);
+                flat.put("error", nested.optString("code", "tai_error"));
+                flat.put("message", nested.optString("message", ""));
+                flat.put("_statusCode", result.optInt("_statusCode", 500));
+                return maybeTextResponse(request, "speak", flat);
+            }
+        }
+        return maybeTextResponse(request, "speak", isSpeechFailure(result) ? speechFailure(result) : result);
+    }
+
+    /** The speak request from a JSON body, or from a text body plus {@code voice/speed/model/format} query parameters. */
+    private JSONObject speakBody(HttpRequest request) throws JSONException {
+        String contentType = request.headers.get("content-type");
+        String raw = request.body == null ? "" : request.body;
+        boolean json = contentType == null ? raw.trim().startsWith("{") : contentType.toLowerCase(Locale.ROOT).contains("json");
+        JSONObject body = json && !raw.trim().isEmpty() ? new JSONObject(raw) : new JSONObject();
+        if (!json) body.put("input", raw);
+        Map<String, String> query = queryParameters(request.query);
+        for (String key : new String[] {"voice", "model"}) {
+            String value = query.get(key);
+            if (value != null && !value.trim().isEmpty()) body.put(key, value.trim());
+        }
+        String speed = query.get("speed");
+        if (speed != null && !speed.trim().isEmpty()) {
+            try {
+                body.put("speed", Double.parseDouble(speed.trim()));
+            } catch (NumberFormatException e) {
+                body.put("speed", speed.trim());
+            }
+        }
+        String format = query.get("format");
+        if (format == null) format = query.get("response_format");
+        if (format != null && !format.trim().isEmpty()) body.put("response_format", format.trim());
+        return body;
+    }
+
+    /** A speech answer that is a refusal or a failure rather than a summary. */
+    private static boolean isSpeechFailure(JSONObject result) {
+        return result.has("error") && !result.optBoolean("ok", false);
+    }
+
+    /** A failure with a status: the runtime client's own errors carry none, and must not go out as 200. */
+    private static JSONObject speechFailure(JSONObject result) throws JSONException {
+        if (!result.has("_statusCode")) result.put("_statusCode", 500);
+        return result;
+    }
+
+    /**
+     * OpenAI POST /v1/audio/transcriptions. Multipart ({@code file}, {@code model}, {@code language},
+     * {@code prompt}, {@code response_format}) is the OpenAI shape and what
+     * {@code tai transcribe} sends; the upload is written under {@code cacheDir/tai-ipc} and handed
+     * to the runtime process as a path, since audio never crosses the Messenger inline. A JSON body
+     * with a {@code file} path is accepted too, for scripts on the phone. {@code response_format}
+     * {@code text} answers the transcript as text/plain; {@code json} (the default) {@code {"text": …}}.
+     */
+    private HttpResponse audioTranscriptions(Context context, HttpRequest request) throws JSONException {
+        JSONObject taiRequest;
+        File upload = null;
+        String contentType = request.headers.get("content-type");
+        if (MultipartFormData.isMultipart(contentType)) {
+            Map<String, MultipartFormData.Part> parts;
+            try {
+                parts = MultipartFormData.parse(request.bodyBytes, contentType);
+            } catch (IllegalArgumentException e) {
+                return jsonResponse(statusError(400, "bad_request", "Malformed multipart body: " + e.getMessage()));
+            }
+            MultipartFormData.Part file = parts.get("file");
+            if (file == null || file.data.length == 0) {
+                return jsonResponse(statusError(400, "stt_audio_missing", "Multipart field 'file' with the audio is required."));
+            }
+            taiRequest = new JSONObject();
+            for (String field : new String[] {"model", "language", "prompt", "response_format"}) {
+                MultipartFormData.Part part = parts.get(field);
+                if (part != null && part.filename == null) taiRequest.put(field, part.text());
+            }
+            try {
+                upload = writeSttUpload(context, file);
+            } catch (IOException e) {
+                return jsonResponse(statusError(500, "stt_upload_failed", "Could not store the upload: " + e.getMessage()));
+            }
+            taiRequest.put("file", upload.getAbsolutePath());
+        } else {
+            taiRequest = request.body == null || request.body.trim().isEmpty() ? new JSONObject() : new JSONObject(request.body);
+        }
+        String format = taiRequest.optString("response_format", "json").trim().toLowerCase(Locale.ROOT);
+        if (!format.isEmpty() && !"json".equals(format) && !"text".equals(format) && !"verbose_json".equals(format)) {
+            deleteQuietly(upload);
+            return jsonResponse(statusError(400, "unsupported_response_format",
+                "response_format must be json, verbose_json or text."));
+        }
+        JSONObject result;
+        try {
+            result = TaiManager.getInstance(context).transcribe(taiRequest.toString());
+        } finally {
+            // The runtime process deletes the upload once it has read it; this covers every early exit.
+            deleteQuietly(upload);
+        }
+        boolean failed = result.optInt("_statusCode", 200) >= 400 || result.has("error");
+        if (failed) {
+            JSONObject nested = result.optJSONObject("error");
+            if (nested != null && "text".equalsIgnoreCase(request.headers.get("x-tai-output"))) {
+                // The CLI formatter reads flat {error, message}; the runtime answers OpenAI's nested shape.
+                JSONObject flat = new JSONObject();
+                flat.put("ok", false);
+                flat.put("error", nested.optString("code", "tai_error"));
+                flat.put("message", nested.optString("message", ""));
+                flat.put("_statusCode", result.optInt("_statusCode", 500));
+                return maybeTextResponse(request, "transcribe", flat);
+            }
+            return maybeTextResponse(request, "transcribe", result);
+        }
+        String text = result.optString("text", "");
+        if ("text".equals(format) || "text".equalsIgnoreCase(request.headers.get("x-tai-output"))) {
+            return new HttpResponse(200, "text/plain; charset=utf-8", (text + "\n").getBytes(StandardCharsets.UTF_8), null);
+        }
+        JSONObject response = new JSONObject();
+        response.put("text", text);
+        if ("verbose_json".equals(format)) {
+            response.put("task", "transcribe");
+            response.put("language", result.optString("language", ""));
+            response.put("duration", result.optDouble("duration", 0.0));
+            response.put("segments", result.optJSONArray("segments") == null ? new JSONArray() : result.optJSONArray("segments"));
+        }
+        JSONObject tai = new JSONObject();
+        for (String key : new String[] {"model", "language", com.termux.ai.WhisperLanguageDetection.RESPONSE_SOURCE,
+                com.termux.ai.WhisperLanguageDetection.RESPONSE_DETECTED, com.termux.ai.WhisperLanguageDetection.RESPONSE_PROBABILITY,
+                "duration", "windowSeconds", "biased", "timings", "_runtime"}) {
+            if (result.has(key)) tai.put(key, result.get(key));
+        }
+        response.put("tai", tai);
+        return jsonResponse(response);
+    }
+
+    /** Writes an uploaded audio part to {@code cacheDir/tai-ipc/stt-<id>.<ext>} for the runtime process to read. */
+    private File writeSttUpload(Context context, MultipartFormData.Part file) throws IOException {
+        File dir = new File(context.getCacheDir(), TaiManager.STT_IPC_DIR);
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
+        String extension = "wav";
+        if (file.filename != null) {
+            int dot = file.filename.lastIndexOf('.');
+            String candidate = dot >= 0 ? file.filename.substring(dot + 1).toLowerCase(Locale.ROOT) : "";
+            if (candidate.matches("[a-z0-9]{1,5}")) extension = candidate;
+        }
+        File out = new File(dir, "stt-" + UUID.randomUUID() + "." + extension);
+        try (FileOutputStream stream = new FileOutputStream(out)) {
+            stream.write(file.data);
+        }
+        return out;
+    }
+
+    private static void deleteQuietly(@Nullable File file) {
+        if (file == null) return;
+        try {
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private JSONObject statusError(int statusCode, String code, String message) throws JSONException {
+        JSONObject error = jsonError(code, message);
+        error.put("_statusCode", statusCode);
+        return error;
+    }
+
+    /**
      * Legacy Ollama POST /api/embeddings: {model, prompt} in, {embedding: [...]} out.
      */
     private JSONObject legacyOllamaEmbeddings(Context context, String body) throws JSONException {
@@ -696,10 +1143,12 @@ public class LauncherCtlApiServer {
      */
     /**
      * The pane routes, for agents and scripts that want a pane of their own to show their work in:
-     * {@code GET /v1/panes}, {@code POST /v1/panes}, {@code POST /v1/panes/{id}/focus|close|write}
-     * and {@code GET /v1/panes/{id}/text}. Each is one terminal action run on the UI thread, and
-     * the dispatcher enforces that write, text and close only reach panes opened through this API
-     * — the token buys a pane, never the user's shells.
+     * {@code GET /v1/panes}, {@code POST /v1/panes}, {@code GET /v1/panes/{id}},
+     * {@code POST /v1/panes/{id}/focus|close|write|resize} and {@code GET /v1/panes/{id}/text}.
+     * Each is one terminal action run on the UI thread, and the dispatcher enforces that write,
+     * text, resize and close only reach panes opened through this API — the token buys a pane,
+     * never the user's shells. {@code POST /v1/panes/{id}/wait} is the exception that does not
+     * come through here; see {@link #startPaneWait}.
      *
      * <p>{@code isAttached()} only fails once the Activity is gone (finishing or destroyed) — every
      * pane tool is in {@link com.termux.app.terminal.TerminalActionDispatcher}'s background-safe
@@ -738,6 +1187,147 @@ public class LauncherCtlApiServer {
         if (!dispatcher.isAttached()) {
             JSONObject error = jsonError("activity_not_running",
                 "The launcher is not running right now, so panes cannot be driven");
+            error.put("_statusCode", 409);
+            return error;
+        }
+        return dispatcher.execute(toolName, arguments);
+    }
+
+    /** The 403 every pane and window route answers while the setting is off; null while it is on. */
+    @Nullable
+    private JSONObject panesApiRefusal(Context context) throws JSONException {
+        if (TermuxAppSharedPreferences.build(context).isAgentPanesEnabled()) return null;
+        JSONObject error = jsonError("panes_api_disabled",
+            "Pane access for scripts is switched off in Settings > Terminal & Status > Sessions and panes");
+        error.put("_statusCode", 403);
+        return error;
+    }
+
+    /**
+     * A pane or window route's answer. An open whose body asked {@code "print":"id"} and worked is
+     * answered with the new pane's id alone, as one line of text, so {@code launcherctl … --print-id}
+     * and a plain {@code curl} get it without parsing JSON; anything else, refusals included, is the
+     * usual JSON.
+     */
+    private HttpResponse openedResponse(HttpRequest request, JSONObject result) {
+        boolean open = "POST".equals(request.method)
+            && ("/v1/panes".equals(request.path) || "/v1/windows".equals(request.path));
+        if (open && result.optBoolean("ok", false) && "id".equals(printField(request.body))) {
+            String id = openedPaneId(result);
+            if (id != null) {
+                return new HttpResponse(result.optInt("_statusCode", 200), "text/plain; charset=utf-8",
+                    (id + "\n").getBytes(StandardCharsets.UTF_8), null);
+            }
+        }
+        return jsonResponse(result);
+    }
+
+    /** The body's {@code print} field, or null when there is none or the body is not JSON. */
+    @Nullable
+    static String printField(@Nullable String body) {
+        if (body == null || body.trim().isEmpty()) return null;
+        try {
+            Object print = new JSONObject(body).opt("print");
+            return print instanceof String ? (String) print : null;
+        } catch (JSONException e) {
+            return null;
+        }
+    }
+
+    /** The new pane's id in a pane or window open's answer: {@code pane.id}, or the window's {@code pane}. */
+    @Nullable
+    static String openedPaneId(@NonNull JSONObject result) {
+        JSONObject pane = result.optJSONObject("pane");
+        String id = pane != null ? pane.optString("id", "") : result.optString("pane", "");
+        return id.isEmpty() ? null : id;
+    }
+
+    /**
+     * {@code POST /v1/panes/{id}/wait} on a {@link #paneWaitExecutor} thread: the same gate and
+     * the same {@code activity_not_running} answer as the other pane routes, then {@link PaneWait},
+     * reading the pane through the dispatcher one poll at a time.
+     */
+    private JSONObject runPaneWait(Context context, HttpRequest request) throws JSONException {
+        JSONObject refusal = panesApiRefusal(context);
+        if (refusal != null) return refusal;
+        JSONObject body;
+        try {
+            body = request.body == null || request.body.trim().isEmpty()
+                ? new JSONObject() : new JSONObject(request.body);
+        } catch (JSONException e) {
+            JSONObject error = jsonError("bad_request", "Request body must be a JSON object");
+            error.put("_statusCode", 400);
+            return error;
+        }
+        JSONObject[] invalid = new JSONObject[1];
+        PaneWait wait = PaneWait.parse(paneIdFrom(request.path), body, invalid);
+        if (wait == null) return invalid[0];
+        com.termux.app.terminal.TerminalActionDispatcher dispatcher =
+            com.termux.app.terminal.TerminalActionDispatcher.getInstance();
+        if (!dispatcher.isAttached()) {
+            JSONObject error = jsonError("activity_not_running",
+                "The launcher is not running right now, so panes cannot be driven");
+            error.put("_statusCode", 409);
+            return error;
+        }
+        return wait.run(arguments -> dispatcher.execute(
+            com.termux.app.terminal.TerminalActionDispatcher.TOOL_PANE_READ, arguments),
+            PaneWait.SYSTEM_CLOCK);
+    }
+
+    /**
+     * {@code POST /v1/windows}: a whole new window (not a split), for the same shell-driven
+     * callers as the pane routes above — {@code launcherctl window open}, or an agent that wants a
+     * full-size window of its own rather than a pane sharing the current one. Runs through
+     * {@link com.termux.app.terminal.TerminalActionDispatcher#TOOL_WINDOW_OPEN}, which is in the
+     * same background-safe allowlist as {@code pane.open}, and registers the opened pane with the
+     * same ownership the pane routes use, so {@code /v1/panes/{id}/write|read|close} reach it too.
+     */
+    private JSONObject runWindowOpenRequest(HttpRequest request) throws JSONException {
+        JSONObject arguments;
+        if (request.body == null || request.body.trim().isEmpty()) {
+            arguments = new JSONObject();
+        } else {
+            try {
+                arguments = new JSONObject(request.body);
+            } catch (JSONException e) {
+                JSONObject error = jsonError("bad_request", "Request body must be a JSON object");
+                error.put("_statusCode", 400);
+                return error;
+            }
+        }
+        com.termux.app.terminal.TerminalActionDispatcher dispatcher =
+            com.termux.app.terminal.TerminalActionDispatcher.getInstance();
+        if (!dispatcher.isAttached()) {
+            JSONObject error = jsonError("activity_not_running",
+                "The launcher is not running right now, so a window cannot be opened");
+            error.put("_statusCode", 409);
+            return error;
+        }
+        return dispatcher.execute(
+            com.termux.app.terminal.TerminalActionDispatcher.TOOL_WINDOW_OPEN, arguments);
+    }
+
+    /**
+     * {@code POST /v1/windows/{id}/focus|close}: bring up a window of the current session, or close
+     * one this API opened, by the window id {@code GET /v1/panes} lists (or the id of a pane in
+     * it). Background-safe like the pane routes; the dispatcher enforces that close only reaches
+     * windows whose every pane was opened through this API.
+     */
+    private JSONObject runWindowRequest(HttpRequest request) throws JSONException {
+        String toolName = windowToolFor(request.method, request.path);
+        if (toolName == null) {
+            JSONObject error = jsonError("not_found", "Unknown window endpoint");
+            error.put("_statusCode", 404);
+            return error;
+        }
+        JSONObject arguments = new JSONObject();
+        arguments.put("id", paneIdFrom(request.path));
+        com.termux.app.terminal.TerminalActionDispatcher dispatcher =
+            com.termux.app.terminal.TerminalActionDispatcher.getInstance();
+        if (!dispatcher.isAttached()) {
+            JSONObject error = jsonError("activity_not_running",
+                "The launcher is not running right now, so windows cannot be driven");
             error.put("_statusCode", 409);
             return error;
         }
@@ -815,6 +1405,68 @@ public class LauncherCtlApiServer {
         return dispatcher.execute(toolName, arguments);
     }
 
+    /**
+     * The signal routes: {@code POST /v1/notify}, {@code POST /v1/progress}, {@code POST} and
+     * {@code GET /v1/clipboard}. Each is the local-API way in to the one {@code ShellSignals}
+     * method the matching escape sequence (OSC 99, OSC 9;4, OSC 52) already runs, for a process
+     * that has no terminal to write an escape into — a coding agent's tool runner, say. No pane
+     * id is needed: the body's optional {@code pane} attributes the signal to a specific pane,
+     * and without one it goes to the current pane. Background-safe like the pane routes, so
+     * {@code activity_not_running} again means the launcher is not running at all; the clipboard
+     * routes answer with their own codes when the launcher is merely off screen.
+     */
+    private JSONObject runSignalRequest(HttpRequest request) throws JSONException {
+        String toolName = signalToolFor(request.method, request.path);
+        if (toolName == null) {
+            JSONObject error = jsonError("not_found", "Unknown endpoint");
+            error.put("_statusCode", 404);
+            return error;
+        }
+        JSONObject arguments;
+        if (request.body == null || request.body.trim().isEmpty()) {
+            arguments = new JSONObject();
+        } else {
+            try {
+                arguments = new JSONObject(request.body);
+            } catch (JSONException e) {
+                JSONObject error = jsonError("bad_request", "Request body must be a JSON object");
+                error.put("_statusCode", 400);
+                return error;
+            }
+        }
+        for (Map.Entry<String, String> parameter : queryParameters(request.query).entrySet()) {
+            if (!arguments.has(parameter.getKey())) {
+                arguments.put(parameter.getKey(), parameter.getValue());
+            }
+        }
+        com.termux.app.terminal.TerminalActionDispatcher dispatcher =
+            com.termux.app.terminal.TerminalActionDispatcher.getInstance();
+        if (!dispatcher.isAttached()) {
+            JSONObject error = jsonError("activity_not_running",
+                "The launcher is not running right now, so there is nobody to signal");
+            error.put("_statusCode", 409);
+            return error;
+        }
+        return dispatcher.execute(toolName, arguments);
+    }
+
+    /** The terminal action a signal route maps to, or null for anything else. */
+    @Nullable
+    static String signalToolFor(@NonNull String method, @NonNull String path) {
+        switch (path) {
+            case "/v1/notify":
+                return "POST".equals(method) ? com.termux.app.terminal.TerminalActionDispatcher.TOOL_SHELL_NOTIFY : null;
+            case "/v1/progress":
+                return "POST".equals(method) ? com.termux.app.terminal.TerminalActionDispatcher.TOOL_SHELL_PROGRESS : null;
+            case "/v1/clipboard":
+                if ("POST".equals(method)) return com.termux.app.terminal.TerminalActionDispatcher.TOOL_CLIPBOARD_WRITE;
+                if ("GET".equals(method)) return com.termux.app.terminal.TerminalActionDispatcher.TOOL_CLIPBOARD_READ;
+                return null;
+            default:
+                return null;
+        }
+    }
+
     /** The terminal action a keyboard route maps to, or null for anything else. */
     @Nullable
     static String keyboardToolFor(@NonNull String method, @NonNull String path) {
@@ -837,6 +1489,10 @@ public class LauncherCtlApiServer {
             return null;
         }
         String[] parts = path.split("/");
+        // "", "v1", "panes", "<id>": the pane itself, read-only like the list.
+        if (parts.length == 4 && "panes".equals(parts[2]) && !parts[3].isEmpty()) {
+            return "GET".equals(method) ? com.termux.app.terminal.TerminalActionDispatcher.TOOL_PANE_INFO : null;
+        }
         // "", "v1", "panes", "<id>", "<action>"
         if (parts.length != 5 || parts[3].isEmpty()) return null;
         switch (parts[4]) {
@@ -850,22 +1506,53 @@ public class LauncherCtlApiServer {
                 return "GET".equals(method) ? com.termux.app.terminal.TerminalActionDispatcher.TOOL_PANE_READ : null;
             case "agent":
                 return "POST".equals(method) ? com.termux.app.terminal.TerminalActionDispatcher.TOOL_AGENT_STATUS : null;
+            case "resize":
+                return "POST".equals(method) ? com.termux.app.terminal.TerminalActionDispatcher.TOOL_PANE_SET_SIZE : null;
             default:
                 return null;
         }
     }
 
+    /** The terminal action a {@code /v1/windows/{id}/…} route maps to, or null for any other path. */
+    @Nullable
+    static String windowToolFor(@NonNull String method, @NonNull String path) {
+        if (!"POST".equals(method)) return null;
+        String[] parts = path.split("/");
+        // "", "v1", "windows", "<id>", "<action>"
+        if (parts.length != 5 || !"windows".equals(parts[2]) || parts[3].isEmpty()) return null;
+        switch (parts[4]) {
+            case "focus": return com.termux.app.terminal.TerminalActionDispatcher.TOOL_WINDOW_FOCUS;
+            case "close": return com.termux.app.terminal.TerminalActionDispatcher.TOOL_WINDOW_CLOSE_BY_ID;
+            default: return null;
+        }
+    }
+
+    /**
+     * {@code POST /v1/panes/{id}/wait}, which {@link #handleClient} hands to a wait thread of its
+     * own instead of routing it; no dispatcher tool stands behind it, so it is not in
+     * {@link #paneToolFor}.
+     */
+    static boolean isPaneWaitRoute(@NonNull String method, @NonNull String path) {
+        if (!"POST".equals(method) || !path.startsWith("/v1/panes/")) return false;
+        String[] parts = path.split("/");
+        return parts.length == 5 && !parts[3].isEmpty() && "wait".equals(parts[4]);
+    }
+
+    /** The id in {@code /v1/panes/{id}[/action]} or {@code /v1/windows/{id}/action}, or null. */
     @Nullable
     static String paneIdFrom(@NonNull String path) {
         String[] parts = path.split("/");
+        if (parts.length == 4 && "panes".equals(parts[2]) && !parts[3].isEmpty()) return parts[3];
         return parts.length == 5 && !parts[3].isEmpty() ? parts[3] : null;
     }
 
-    /** Rate-limit key for a request; pane routes share one bucket per action across ids. */
+    /** Rate-limit key for a request; pane and window routes share one bucket per action across ids. */
     @NonNull
     static String rateLimitKey(@NonNull String method, @NonNull String path) {
-        String id = path.startsWith("/v1/panes/") ? paneIdFrom(path) : null;
-        if (id != null) path = path.replace("/" + id + "/", "/*/");
+        String prefix = path.startsWith("/v1/panes/") ? "/v1/panes/"
+            : path.startsWith("/v1/windows/") ? "/v1/windows/" : null;
+        String id = prefix == null ? null : paneIdFrom(path);
+        if (id != null) path = prefix + "*" + path.substring(prefix.length() + id.length());
         return method + ":" + path;
     }
 
@@ -1158,6 +1845,7 @@ public class LauncherCtlApiServer {
             if (bodyBytes.length != contentLength) {
                 throw new HttpParseException(400, "bad_request", "Incomplete request body");
             }
+            request.bodyBytes = bodyBytes;
             request.body = new String(bodyBytes, StandardCharsets.UTF_8);
         } else {
             request.body = "";
@@ -1360,10 +2048,18 @@ public class LauncherCtlApiServer {
         rateLimiters.put("POST:/v1/auth/rotate", new SimpleRateLimiter(5, 60_000));
         rateLimiters.put("GET:/v1/panes", new SimpleRateLimiter(240, 60_000));
         rateLimiters.put("POST:/v1/panes", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("POST:/v1/windows", new SimpleRateLimiter(30, 60_000));
         rateLimiters.put("POST:/v1/panes/*/focus", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("POST:/v1/panes/*/close", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("POST:/v1/panes/*/resize", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("POST:/v1/windows/*/focus", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("POST:/v1/windows/*/close", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("POST:/v1/panes/*/write", new SimpleRateLimiter(240, 60_000));
         rateLimiters.put("GET:/v1/panes/*/text", new SimpleRateLimiter(240, 60_000));
+        rateLimiters.put("GET:/v1/panes/*", new SimpleRateLimiter(240, 60_000));
+        // Each wait is one request however long it holds; the threads behind them are capped
+        // separately (PaneWait.MAX_CONCURRENT).
+        rateLimiters.put("POST:/v1/panes/*/wait", new SimpleRateLimiter(240, 60_000));
         // Agent hooks fire on every prompt, tool approval and turn end, so the ceiling is high; the
         // hooks installer is a one-off and stays low.
         rateLimiters.put("POST:/v1/panes/*/agent", new SimpleRateLimiter(600, 60_000));
@@ -1371,13 +2067,42 @@ public class LauncherCtlApiServer {
         // A focus script calls these once per field the user touches.
         rateLimiters.put("POST:/v1/keyboard/show", new SimpleRateLimiter(240, 60_000));
         rateLimiters.put("POST:/v1/keyboard/hide", new SimpleRateLimiter(240, 60_000));
+        // A progress ring is updated as often as a build prints a percentage, so it sits with
+        // the agent hooks; a notification a second is already more than a shade can show, and
+        // the clipboard is a thing a person copies, not a channel.
+        rateLimiters.put("POST:/v1/notify", new SimpleRateLimiter(60, 60_000));
+        // Notification history reads: an agent may query a few times while it works; clearing is
+        // a deliberate act.
+        rateLimiters.put("GET:/v1/notifications", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("GET:/v1/notifications/apps", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("GET:/v1/notifications/active", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("POST:/v1/notifications/clear", new SimpleRateLimiter(10, 60_000));
+        rateLimiters.put("POST:/v1/progress", new SimpleRateLimiter(600, 60_000));
+        rateLimiters.put("POST:/v1/clipboard", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("GET:/v1/clipboard", new SimpleRateLimiter(60, 60_000));
+        // Device routes: a motor, an LED and a mixer are things a script pokes now and then, not
+        // a channel; battery is a cheap sticky read a status loop may poll.
+        rateLimiters.put("POST:/v1/vibrate", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("POST:/v1/torch", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("GET:/v1/battery", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("GET:/v1/volume", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("POST:/v1/volume", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("POST:/v1/toast", new SimpleRateLimiter(60, 60_000));
+        // A wallpaper set makes system_server re-encode the picture, which takes seconds and
+        // memory; a script changes it now and then, so the limit is tight.
+        rateLimiters.put("POST:/v1/wallpaper", new SimpleRateLimiter(6, 60_000));
+        rateLimiters.put("GET:/v1/wallpaper", new SimpleRateLimiter(30, 60_000));
         rateLimiters.put("GET:/v1/ai/status", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("GET:/v1/ai/runtime", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("POST:/v1/ai/tier", new SimpleRateLimiter(30, 60_000));
         rateLimiters.put("GET:/v1/ai/models", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("POST:/v1/ai/models/import", new SimpleRateLimiter(20, 60_000));
         rateLimiters.put("POST:/v1/ai/models/download", new SimpleRateLimiter(20, 60_000));
         rateLimiters.put("POST:/v1/ai/models/download-catalog", new SimpleRateLimiter(20, 60_000));
         rateLimiters.put("POST:/v1/ai/models/downloads/cancel", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("POST:/v1/ai/models/downloads/pause", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("POST:/v1/ai/models/downloads/resume", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("POST:/v1/ai/models/downloads/prioritize", new SimpleRateLimiter(30, 60_000));
         rateLimiters.put("GET:/v1/ai/models/downloads", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("POST:/v1/ai/models/delete", new SimpleRateLimiter(30, 60_000));
         rateLimiters.put("POST:/v1/ai/models/load", new SimpleRateLimiter(20, 60_000));
@@ -1386,13 +2111,31 @@ public class LauncherCtlApiServer {
         rateLimiters.put("POST:/v1/ai/runtime/preflight", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("POST:/v1/ai/runtime/unload", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("POST:/v1/ai/runtime/keep-warm", new SimpleRateLimiter(60, 60_000));
+        // A benchmark run does real generation for minutes; a request budget generous callers never
+        // hit is still a guard against a runaway script hammering it.
+        rateLimiters.put("POST:/v1/ai/runtime/benchmark", new SimpleRateLimiter(6, 60_000));
+        rateLimiters.put("POST:/v1/ai/benchmarks/run", new SimpleRateLimiter(6, 60_000));
+        rateLimiters.put("GET:/v1/ai/benchmarks", new SimpleRateLimiter(120, 60_000));
+        rateLimiters.put("DELETE:/v1/ai/benchmarks", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("GET:/v1/ai/logs", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("DELETE:/v1/ai/logs", new SimpleRateLimiter(30, 60_000));
+        rateLimiters.put("DELETE:/v1/ai/runtime/history", new SimpleRateLimiter(30, 60_000));
         rateLimiters.put("POST:/v1/ai/runtime/cancel", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("POST:/v1/ai/benchmarks/skip-wait", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("GET:/v1/models", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("POST:/v1/chat/completions", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("POST:/v1/responses", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("POST:/v1/completions", new SimpleRateLimiter(60, 60_000));
         rateLimiters.put("POST:/v1/embeddings", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("POST:/v1/tokenize", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("POST:/v1/audio/speech", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("POST:/v1/ai/speak", new SimpleRateLimiter(60, 60_000));
+        rateLimiters.put("POST:/v1/ai/speak/stop", new SimpleRateLimiter(120, 60_000));
+        // An image takes seconds to minutes and holds the GPU; a dozen a minute is far past what one phone can make.
+        rateLimiters.put("POST:/v1/ai/images/generations", new SimpleRateLimiter(12, 60_000));
+        rateLimiters.put("POST:/v1/ai/images/cancel", new SimpleRateLimiter(60, 60_000));
+        // Voice input sends one request per spoken phrase; a fast talker is a few per second.
+        rateLimiters.put("POST:/v1/audio/transcriptions", new SimpleRateLimiter(240, 60_000));
         rateLimiters.put("GET:/api/version", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("GET:/api/tags", new SimpleRateLimiter(120, 60_000));
         rateLimiters.put("POST:/api/show", new SimpleRateLimiter(120, 60_000));
@@ -1484,7 +2227,10 @@ public class LauncherCtlApiServer {
         supportedEndpoints.put("/v1/responses");
         supportedEndpoints.put("/v1/completions");
         supportedEndpoints.put("/v1/embeddings");
+        supportedEndpoints.put("/v1/tokenize");
         supportedEndpoints.put("/v1/audio/speech");
+        supportedEndpoints.put("/v1/audio/transcriptions");
+        supportedEndpoints.put("/v1/ai/images/generations");
         supportedEndpoints.put("/v1/apps/launch");
         supportedEndpoints.put("/api/version");
         supportedEndpoints.put("/api/tags");
@@ -1496,8 +2242,10 @@ public class LauncherCtlApiServer {
         supportedEndpoints.put("/api/embeddings");
         data.put("supportedEndpoints", supportedEndpoints);
         data.put("embeddingsNote", "Embeddings support is model-capability dependent; check /v1/models _capabilities for text_embeddings.");
-        data.put("audioOutputNote", "Audio output returns an explicit unsupported_audio_output error until a local runner exposes generated audio.");
-        data.put("modelFormatNote", "TAI supports LiteRT-LM and MNN model packages only; GGUF/raw weights are not supported by this APK.");
+        data.put("audioOutputNote", "/v1/audio/speech speaks with the installed voice model (KittenTTS nano, on the CPU in :tai_runtime): input (up to 4096 characters), voice (Bruno, Hugo, Jasper, Rosie or an OpenAI voice name), speed (0.5-2.0), response_format wav (whole file) or pcm (24 kHz 16-bit mono, streamed per sentence).");
+        data.put("audioInputNote", "/v1/audio/transcriptions runs the installed speech model (Parakeet or Whisper ACFT, the one voice input uses) on the CPU; multipart file (WAV or raw PCM16 16 kHz mono), model, language, prompt, response_format json|text.");
+        data.put("imageGenerationNote", "/v1/ai/images/generations makes one image per request with an MNN diffusion model (Stable Diffusion 1.5 and Taiyi at 512x512, Sana at 256-2048 in multiples of 32): model or model_path, prompt, size, steps, seed, cfg_scale (Sana), image (Sana edit), backend opencl|cpu, memory_mode 0|1|2, output (a .png path) or b64_json, stream for progress events. The engine cannot stop mid-run; /v1/ai/images/cancel discards the result.");
+        data.put("modelFormatNote", "On-device AI supports LiteRT-LM and MNN model packages only; GGUF/raw weights are not supported by this APK.");
         if (includeToken) {
             data.put("token", settings.getOrCreateApiToken());
         }
@@ -1533,48 +2281,105 @@ public class LauncherCtlApiServer {
         return "0.0.0.0";
     }
 
-    private void installTaiCliScripts() {
-        File loginBinary = new File(TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/login");
-        if (!loginBinary.exists()) {
-            Logger.logInfo(LOG_TAG, "Skipping TAI CLI install until bootstrap is initialized.");
-            return;
-        }
-
-        String taiScript =
-            "#!" + TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/sh\n" +
+    /** The {@code tai} CLI script; resources/bin/tai is its twin and TaiCliScriptTest keeps them in step. */
+    static String taiCliScript(String binPrefixDir) {
+        return
+            "#!" + binPrefixDir + "/sh\n" +
             "set -eu\n" +
             "print_help() {\n" +
             "  cat <<'EOF'\n" +
-            "TAI / Termux AI - local multi-backend model host\n" +
+            "On-device AI - local multi-backend model host\n" +
             "\n" +
             "Usage:\n" +
             "  tai --json <command>\n" +
             "  tai status\n" +
-            "  tai runtime\n" +
+            "  tai runtime [--clear-history]\n" +
+            "  tai logs [--lines N] [--clear]\n" +
             "  tai models\n" +
             "  tai import <path> [model-id]\n" +
             "  tai download <model-id> <https-url> --accept-terms\n" +
             "  tai downloads\n" +
+            "  tai download-pause <model-id>\n" +
+            "  tai download-resume <model-id>\n" +
+            "  tai download-now <model-id>\n" +
             "  tai download-cancel <model-id>\n" +
             "  tai delete <model-id>\n" +
             "  tai preflight [model] [--auto|--cpu|--gpu]\n" +
-            "  tai load [model] [--auto|--cpu|--gpu]\n" +
+            "  tai load [model] [--auto|--cpu|--gpu] [--fresh]\n" +
             "  tai unload\n" +
             "  tai keep-warm [model] [--minutes N] [--auto|--cpu|--gpu]\n" +
             "  tai cancel\n" +
+            "  tai benchmark [model...] [--preset quick|standard] [--cpu|--gpu] [--compare] [--eagle] [--force]\n" +
+            "  tai benchmark --results | --clear [model] | --skip-wait\n" +
+            "  tai benchmark --native [model] [--gpu|--cpu] [--prefill N] [--decode N] [--runs N] [--force]\n" +
+            "  tai transcribe <file.wav> [--model id] [--language xx] [--prompt \"words\"]\n" +
+            "  tai speak [--voice Bruno|Hugo|Jasper|Rosie] [--speed N] [--out file.wav] [text]\n" +
+            "  agent | tai speak [--whole|--stream]\n" +
+            "  tai speak --stop\n" +
+            "  tai image \"prompt\" [--model ID | --model-dir DIR] [--type sd15|taiyi|sana] [--out FILE.png] [--steps N]\n" +
+            "             [--seed N] [--size WxH] [--cfg X] [--image IN.png] [--cpu] [--memory-mode 0|1|2]\n" +
+            "  tai image --stop\n" +
             "  tai doctor\n" +
             "\n" +
-            "TAI is authenticated through ~/.launcherctl and runs native AI in the isolated :tai_runtime process.\n" +
+            "On-device AI is authenticated through ~/.launcherctl and runs native AI in the isolated :tai_runtime process.\n" +
             "LiteRT-LM and MNN load in :tai_runtime after ABI/API/library/model/memory preflight.\n" +
             "MNN models route through the bundled MNN backend when supported by the installed APK.\n" +
             "GGUF/raw weight files are not supported by this APK.\n" +
-            "Auto defaults to CPU on unknown devices; GPU is used automatically only after a successful device/model history.\n" +
+            "Auto tries the GPU first and the CPU after a recorded GPU failure. Every load is sized to the memory\n" +
+            "free at that moment: the context window shrinks to fit (down to 4096 tokens), and a load that\n" +
+            "cannot fit is refused rather than started.\n" +
+            "--fresh on tai load throws away the model's MNN mmap weight cache before loading, so it is\n" +
+            "rebuilt from scratch instead of reused; use it if a loaded MNN model starts giving degenerate\n" +
+            "replies (repeated characters, whatever the sampling settings).\n" +
+            "tai benchmark runs bench v2 on each model, timed the same way for LiteRT-LM and MNN: a cold\n" +
+            "load, then three tests that stand for real use. Chat asks an everyday question and times the\n" +
+            "first token (starts replying in X s) and the writing speed (N tok/s over up to 320 tokens).\n" +
+            "Long input pastes a build log of about 2000 tokens and asks for a two-sentence answer; the wait\n" +
+            "for the first token is how long the phone takes to read a long page, and the process's peak\n" +
+            "memory is sampled meanwhile. Sanity asks three questions with known answers and only shows\n" +
+            "when one fails (Broken). Each model gets a one-word verdict: Smooth, Usable or Slow, from those\n" +
+            "three figures. Quick runs each test once, standard twice (the median is kept), on the processor\n" +
+            "an automatic load would pick; --compare runs the CPU and the GPU where the model supports\n" +
+            "both. Each load goes through the usual preflight and memory budget, and a refusal skips that entry with\n" +
+            "the reason. Results are kept in files/tai/benchmarks.json: --results prints the leaderboard,\n" +
+            "--clear removes them (for one model when named). Chat requests are refused while a benchmark\n" +
+            "runs; tai cancel stops it, keeping the phases that finished. A run refuses to start below 30%\n" +
+            "battery (unless charging) or above LIGHT thermal status; while running, battery below 15% (and\n" +
+            "not charging) or SEVERE+ thermal stops it, and MODERATE thermal pauses it until it recovers.\n" +
+            "--force skips the start check only. A later model waits out a cool-down against the run's\n" +
+            "starting thermal reading before it loads; --skip-wait ends that wait at once and marks the\n" +
+            "next result \"warm start\". --native runs LiteRT-LM's own benchmark() instead (256 prefill/256\n" +
+            "decode tokens, 3 runs; LiteRT-LM models only), the call Google AI Edge Gallery's Benchmark\n" +
+            "screen uses, for comparing numbers with it.\n" +
+            "tai transcribe runs the speech model voice input uses (Keyboard settings > Voice input > Speech\n" +
+            "model) on a WAV file (16 kHz mono PCM16 preferred; other rates are resampled) or raw PCM16\n" +
+            "16 kHz mono, on the CPU in :tai_runtime, never queued behind a chat generation. --prompt\n" +
+            "gives Whisper a vocabulary line to bias towards (Parakeet has no prompt); --language forces\n" +
+            "an ISO 639-1 code on multilingual Whisper models (the -en models always decode English,\n" +
+            "Parakeet detects the language itself).\n" +
+            "tai speak reads text aloud on the phone with the voice model (Model centre > Speech > Voice\n" +
+            "output): the text from the command line or stdin, the voice and speed from the options or\n" +
+            "On-device AI settings. Speech starts after the first sentence; Ctrl-C or tai speak --stop stops it.\n" +
+            "--out file.wav saves the audio instead of playing it.\n" +
+            "agent | tai speak speaks piped text sentence by sentence as the lines arrive (colour codes and\n" +
+            "markdown marks are dropped); --whole collects everything first, --stream forces streaming.\n" +
+            "tai image makes a picture from a text prompt with an MNN diffusion model (Stable Diffusion 1.5, Taiyi,\n" +
+            "Sana), on the GPU through OpenCL unless --cpu. --model names an installed image model; --model-dir points at\n" +
+            "a model folder directly (it needs tokenizer.mtok for Stable Diffusion/Taiyi; Taiyi must be said with --type).\n" +
+            "The PNG is saved to --out (default ./tai-image-<time>.png). Stable Diffusion and Taiyi make 512x512 only;\n" +
+            "Sana takes --size in multiples of 32 (256-2048), --cfg guidance and --image to edit a picture. The first\n" +
+            "load on a phone tunes the GPU kernels and is slow; later loads reuse the cache. --memory-mode 1 is fastest\n" +
+            "and keeps the model loaded, 2 balances, 0 saves memory; left out, the fastest mode that fits is used.\n" +
+            "A run cannot be stopped part-way: Ctrl-C or tai image --stop throws the result away when it finishes.\n" +
             "OpenAI-compatible endpoints (default bind mode is localhost):\n" +
             "  /v1/models\n" +
             "  /v1/chat/completions\n" +
             "  /v1/completions\n" +
             "  /v1/embeddings\n" +
+            "  /v1/tokenize\n" +
+            "  /v1/audio/transcriptions\n" +
             "  /v1/audio/speech\n" +
+            "  /v1/ai/images/generations\n" +
             "Ollama-compatible endpoints: /api/tags /api/chat /api/generate /api/embed /api/embeddings /api/show /api/ps /api/version\n" +
             "\n" +
             "Point OpenAI-compatible terminal tools at this host, e.g.:\n" +
@@ -1586,7 +2391,12 @@ public class LauncherCtlApiServer {
             "Security notes:\n" +
             "  LAN mode (opt-in via settings) exposes the API to your local network and always requires the token.\n" +
             "  /v1/embeddings is model-capability dependent. Not all models support embeddings.\n" +
-            "  /v1/audio/speech returns unsupported_audio_output until a local runner exposes generated audio.\n" +
+            "  /v1/embeddings accepts input_type (\"query\" or \"document\", default \"document\"), an\n" +
+            "  optional document title, dimensions (Matryoshka truncation) and encoding_format (\"float\"\n" +
+            "  or \"base64\"). Each returned item reports tokens and truncated. /v1/tokenize returns\n" +
+            "  {tokens: n} for {model, input} using the same tokenizer, with no task prefix applied.\n" +
+            "  /v1/audio/speech speaks with the installed voice model: input, voice, speed, response_format wav|pcm.\n" +
+            "  /v1/ai/images/generations makes an image: model or model_path, prompt, size, steps, seed, output, stream.\n" +
             "  Check /v1/models for capability metadata (for example, _backend and _capabilities per model).\n" +
             "\n" +
             "Use tai --json <command> for raw API JSON.\n" +
@@ -1620,6 +2430,18 @@ public class LauncherCtlApiServer {
             "    curl $CURL_COMMON -H \"Authorization: Bearer $TOKEN\" \"$BASE$path\"\n" +
             "  fi\n" +
             "}\n" +
+            // A benchmark run does real generation for minutes across up to 10 runs; CURL_COMMON's
+            // --max-time 180 is sized for status/load calls, not this one.
+            "CURL_LONG=\"--fail-with-body -sS --connect-timeout 2 --max-time 1200\"\n" +
+            "post_json_long() {\n" +
+            "  path=\"$1\"\n" +
+            "  data=\"$2\"\n" +
+            "  if [ \"$OUTPUT_MODE\" = \"text\" ]; then\n" +
+            "    curl $CURL_LONG -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" -H \"X-TAI-Output: text\" --data \"$data\" \"$BASE$path\"\n" +
+            "  else\n" +
+            "    curl $CURL_LONG -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" --data \"$data\" \"$BASE$path\"\n" +
+            "  fi\n" +
+            "}\n" +
             "OUTPUT_MODE=text\n" +
             "case \"${1:-}\" in\n" +
             "  --json|-j)\n" +
@@ -1637,7 +2459,33 @@ public class LauncherCtlApiServer {
             "    get_json /v1/ai/status\n" +
             "    ;;\n" +
             "  runtime)\n" +
-            "    get_json /v1/ai/runtime\n" +
+            "    case \"${1:-}\" in\n" +
+            "      --clear-history)\n" +
+            "        if [ \"$OUTPUT_MODE\" = \"text\" ]; then set -- -H \"X-TAI-Output: text\"; else set --; fi\n" +
+            "        curl $CURL_COMMON -X DELETE -H \"Authorization: Bearer $TOKEN\" \"$@\" \"$BASE/v1/ai/runtime/history\"\n" +
+            "        exit $?\n" +
+            "        ;;\n" +
+            "      '') get_json /v1/ai/runtime ;;\n" +
+            "      *) echo \"usage: tai runtime [--clear-history]\" >&2; exit 2 ;;\n" +
+            "    esac\n" +
+            "    ;;\n" +
+            "  logs)\n" +
+            "    lines=''; clear=''\n" +
+            "    while [ \"$#\" -gt 0 ]; do\n" +
+            "      case \"$1\" in\n" +
+            "        --lines) shift; [ \"$#\" -gt 0 ] || { echo \"usage: tai logs [--lines N] [--clear]\" >&2; exit 2; }; lines=\"$1\" ;;\n" +
+            "        --clear) clear=1 ;;\n" +
+            "        *) echo \"usage: tai logs [--lines N] [--clear]\" >&2; exit 2 ;;\n" +
+            "      esac\n" +
+            "      shift\n" +
+            "    done\n" +
+            "    case \"$lines\" in *[!0-9]*) echo \"tai logs: --lines needs a number\" >&2; exit 2 ;; esac\n" +
+            "    if [ -n \"$clear\" ]; then\n" +
+            "      if [ \"$OUTPUT_MODE\" = \"text\" ]; then set -- -H \"X-TAI-Output: text\"; else set --; fi\n" +
+            "      curl $CURL_COMMON -X DELETE -H \"Authorization: Bearer $TOKEN\" \"$@\" \"$BASE/v1/ai/logs\"\n" +
+            "      exit $?\n" +
+            "    fi\n" +
+            "    get_json \"/v1/ai/logs?lines=${lines:-100}\"\n" +
             "    ;;\n" +
             "  models)\n" +
             "    get_json /v1/ai/models\n" +
@@ -1663,10 +2511,25 @@ public class LauncherCtlApiServer {
             "    model=$(json_escape \"$1\")\n" +
             "    post_json /v1/ai/models/downloads/cancel \"{\\\"modelId\\\":\\\"$model\\\"}\"\n" +
             "    ;;\n" +
+            "  download-pause)\n" +
+            "    [ \"$#\" -gt 0 ] || { echo \"usage: tai download-pause <model-id>\" >&2; exit 2; }\n" +
+            "    model=$(json_escape \"$1\")\n" +
+            "    post_json /v1/ai/models/downloads/pause \"{\\\"modelId\\\":\\\"$model\\\"}\"\n" +
+            "    ;;\n" +
+            "  download-resume)\n" +
+            "    [ \"$#\" -gt 0 ] || { echo \"usage: tai download-resume <model-id>\" >&2; exit 2; }\n" +
+            "    model=$(json_escape \"$1\")\n" +
+            "    post_json /v1/ai/models/downloads/resume \"{\\\"modelId\\\":\\\"$model\\\"}\"\n" +
+            "    ;;\n" +
+            "  download-now)\n" +
+            "    [ \"$#\" -gt 0 ] || { echo \"usage: tai download-now <model-id>\" >&2; exit 2; }\n" +
+            "    model=$(json_escape \"$1\")\n" +
+            "    post_json /v1/ai/models/downloads/prioritize \"{\\\"modelId\\\":\\\"$model\\\"}\"\n" +
+            "    ;;\n" +
             "  delete)\n" +
             "    [ \"$#\" -gt 0 ] || { echo \"usage: tai delete <model-id>\" >&2; exit 2; }\n" +
             "    model=$(json_escape \"$1\")\n" +
-            "    post_json /v1/ai/models/delete \"{\\\"modelId\\\":\\\"$model\\\"}\"\n" +
+            "    post_json /v1/ai/models/delete \"{\\\"modelId\\\":\\\"$model\\\",\\\"confirm\\\":true}\"\n" +
             "    ;;\n" +
             "  preflight)\n" +
             "    model=\"\"\n" +
@@ -1688,19 +2551,25 @@ public class LauncherCtlApiServer {
             "  load)\n" +
             "    model=\"\"\n" +
             "    accelerator=\"\"\n" +
+            "    fresh=\"\"\n" +
             "    while [ \"$#\" -gt 0 ]; do\n" +
             "      case \"$1\" in\n" +
             "        --auto) accelerator=auto ;;\n" +
             "        --cpu) accelerator=cpu ;;\n" +
             "        --gpu) accelerator=gpu ;;\n" +
-            "        --*) echo \"usage: tai load [model] [--auto|--cpu|--gpu]\" >&2; exit 2 ;;\n" +
-            "        *) [ -z \"$model\" ] || { echo \"usage: tai load [model] [--auto|--cpu|--gpu]\" >&2; exit 2; }; model=\"$1\" ;;\n" +
+            "        --fresh) fresh=1 ;;\n" +
+            "        --*) echo \"usage: tai load [model] [--auto|--cpu|--gpu] [--fresh]\" >&2; exit 2 ;;\n" +
+            "        *) [ -z \"$model\" ] || { echo \"usage: tai load [model] [--auto|--cpu|--gpu] [--fresh]\" >&2; exit 2; }; model=\"$1\" ;;\n" +
             "      esac\n" +
             "      shift\n" +
             "    done\n" +
-            "    accel_json=\"\"\n" +
-            "    if [ -n \"$accelerator\" ]; then accel_json=\",\\\"accelerator\\\":\\\"$accelerator\\\"\"; fi\n" +
-            "    if [ -n \"$model\" ]; then model_escaped=$(json_escape \"$model\"); post_json /v1/ai/runtime/load \"{\\\"model\\\":\\\"$model_escaped\\\"$accel_json}\"; elif [ -n \"$accelerator\" ]; then post_json /v1/ai/runtime/load \"{\\\"accelerator\\\":\\\"$accelerator\\\"}\"; else post_json /v1/ai/runtime/load '{}'; fi\n" +
+            "    body=\"{}\"\n" +
+            "    sep=\"\"\n" +
+            "    if [ -n \"$model\" ]; then model_escaped=$(json_escape \"$model\"); body=\"{\\\"model\\\":\\\"$model_escaped\\\"\"; sep=\",\"; fi\n" +
+            "    if [ -n \"$accelerator\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body$sep\\\"accelerator\\\":\\\"$accelerator\\\"\"; sep=\",\"; fi\n" +
+            "    if [ -n \"$fresh\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body${sep}\\\"clearCache\\\":true\"; sep=\",\"; fi\n" +
+            "    [ \"$body\" = \"{}\" ] || body=\"$body}\"\n" +
+            "    post_json /v1/ai/runtime/load \"$body\"\n" +
             "    ;;\n" +
             "  unload)\n" +
             "    post_json /v1/ai/runtime/unload '{}'\n" +
@@ -1731,6 +2600,316 @@ public class LauncherCtlApiServer {
             "  cancel)\n" +
             "    post_json /v1/ai/runtime/cancel '{}'\n" +
             "    ;;\n" +
+            "  benchmark)\n" +
+            "    usage_benchmark() { echo \"usage: tai benchmark [model...] [--preset quick|standard] [--cpu|--gpu] [--compare] [--eagle] [--force] | --results | --clear [model] | --skip-wait | --native [model] [--gpu|--cpu] [--prefill N] [--decode N] [--runs N] [--force]\" >&2; exit 2; }\n" +
+            "    if [ \"${1:-}\" = \"--native\" ]; then\n" +
+            "      # The old path: LiteRT-LM's own benchmark(), kept so its numbers can be set against bench v2's.\n" +
+            "      shift\n" +
+            "      model=\"\"\n" +
+            "      accelerator=\"\"\n" +
+            "      prefill=\"\"\n" +
+            "      decode=\"\"\n" +
+            "      runs=\"\"\n" +
+            "      force=\"\"\n" +
+            "      while [ \"$#\" -gt 0 ]; do\n" +
+            "        case \"$1\" in\n" +
+            "          --gpu) accelerator=gpu ;;\n" +
+            "          --cpu) accelerator=cpu ;;\n" +
+            "          --prefill) shift; [ \"$#\" -gt 0 ] || usage_benchmark; prefill=\"$1\" ;;\n" +
+            "          --decode) shift; [ \"$#\" -gt 0 ] || usage_benchmark; decode=\"$1\" ;;\n" +
+            "          --runs) shift; [ \"$#\" -gt 0 ] || usage_benchmark; runs=\"$1\" ;;\n" +
+            "          --force) force=true ;;\n" +
+            "          --*) usage_benchmark ;;\n" +
+            "          *) [ -z \"$model\" ] || usage_benchmark; model=\"$1\" ;;\n" +
+            "        esac\n" +
+            "        shift\n" +
+            "      done\n" +
+            "      body=\"{}\"\n" +
+            "      sep=\"\"\n" +
+            "      if [ -n \"$model\" ]; then model_escaped=$(json_escape \"$model\"); body=\"{\\\"model\\\":\\\"$model_escaped\\\"\"; sep=\",\"; fi\n" +
+            "      if [ -n \"$accelerator\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body$sep\\\"accelerator\\\":\\\"$accelerator\\\"\"; sep=\",\"; fi\n" +
+            "      if [ -n \"$prefill\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body$sep\\\"prefillTokens\\\":$prefill\"; sep=\",\"; fi\n" +
+            "      if [ -n \"$decode\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body$sep\\\"decodeTokens\\\":$decode\"; sep=\",\"; fi\n" +
+            "      if [ -n \"$runs\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body$sep\\\"runs\\\":$runs\"; sep=\",\"; fi\n" +
+            "      if [ -n \"$force\" ]; then [ \"$body\" = \"{}\" ] && { body=\"{\"; sep=\"\"; }; body=\"$body$sep\\\"force\\\":true\"; sep=\",\"; fi\n" +
+            "      [ \"$body\" = \"{}\" ] || body=\"$body}\"\n" +
+            "      post_json_long /v1/ai/runtime/benchmark \"$body\"\n" +
+            "      exit $?\n" +
+            "    fi\n" +
+            "    models=\"\"\n" +
+            "    first_model=\"\"\n" +
+            "    preset=\"\"\n" +
+            "    processors=\"\"\n" +
+            "    compare=\"\"\n" +
+            "    eagle=\"\"\n" +
+            "    force=\"\"\n" +
+            "    results=\"\"\n" +
+            "    clear=\"\"\n" +
+            "    skip_wait=\"\"\n" +
+            "    while [ \"$#\" -gt 0 ]; do\n" +
+            "      case \"$1\" in\n" +
+            "        --preset) shift; [ \"$#\" -gt 0 ] || usage_benchmark; preset=\"$1\" ;;\n" +
+            "        --quick|--standard) preset=\"${1#--}\" ;;\n" +
+            "        --cpu) processors=\"$processors,\\\"cpu\\\"\" ;;\n" +
+            "        --gpu) processors=\"$processors,\\\"gpu\\\"\" ;;\n" +
+            "        --compare) compare=true ;;\n" +
+            "        --eagle) eagle=true ;;\n" +
+            "        --force) force=true ;;\n" +
+            "        --results) results=true ;;\n" +
+            "        --clear) clear=true ;;\n" +
+            "        --skip-wait) skip_wait=true ;;\n" +
+            "        --*) usage_benchmark ;;\n" +
+            "        *) model_escaped=$(json_escape \"$1\"); [ -n \"$first_model\" ] || first_model=\"$model_escaped\"; models=\"$models,\\\"$model_escaped\\\"\" ;;\n" +
+            "      esac\n" +
+            "      shift\n" +
+            "    done\n" +
+            "    case \"$preset\" in ''|quick|standard) ;; *) usage_benchmark ;; esac\n" +
+            "    if [ -n \"$results\" ]; then\n" +
+            "      get_json /v1/ai/benchmarks\n" +
+            "      exit $?\n" +
+            "    fi\n" +
+            "    if [ -n \"$clear\" ]; then\n" +
+            "      if [ -n \"$first_model\" ]; then body=\"{\\\"modelId\\\":\\\"$first_model\\\"}\"; else body='{}'; fi\n" +
+            "      if [ \"$OUTPUT_MODE\" = \"text\" ]; then set -- -H \"X-TAI-Output: text\"; else set --; fi\n" +
+            "      curl $CURL_COMMON -X DELETE -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" \"$@\" --data \"$body\" \"$BASE/v1/ai/benchmarks\"\n" +
+            "      exit $?\n" +
+            "    fi\n" +
+            "    if [ -n \"$skip_wait\" ]; then\n" +
+            "      post_json /v1/ai/benchmarks/skip-wait '{}'\n" +
+            "      exit $?\n" +
+            "    fi\n" +
+            "    body=\"{\\\"preset\\\":\\\"${preset:-standard}\\\"\"\n" +
+            "    [ -z \"$models\" ] || body=\"$body,\\\"models\\\":[${models#,}]\"\n" +
+            "    [ -z \"$processors\" ] || body=\"$body,\\\"processors\\\":[${processors#,}]\"\n" +
+            "    [ -z \"$compare\" ] || body=\"$body,\\\"compare\\\":true\"\n" +
+            "    [ -z \"$eagle\" ] || body=\"$body,\\\"eagle\\\":true\"\n" +
+            "    [ -z \"$force\" ] || body=\"$body,\\\"force\\\":true\"\n" +
+            "    # A standard run over several models can take a good while; the stream keeps the\n" +
+            "    # connection alive with a line per phase. Ctrl-C stops the runtime too, not just this command.\n" +
+            "    CURL_BENCH=\"--fail-with-body -sS --connect-timeout 2 --max-time 14400\"\n" +
+            "    trap 'post_json /v1/ai/runtime/cancel \"{}\" >/dev/null 2>&1; exit 130' INT TERM\n" +
+            "    if [ \"$OUTPUT_MODE\" = \"text\" ]; then\n" +
+            "      body=\"$body,\\\"stream\\\":true}\"\n" +
+            "      set -- -N -H \"X-TAI-Output: text\"\n" +
+            "    else\n" +
+            "      body=\"$body}\"\n" +
+            "      set --\n" +
+            "    fi\n" +
+            "    if curl $CURL_BENCH -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" \"$@\" --data \"$body\" \"$BASE/v1/ai/benchmarks/run\"; then rc=0; else rc=$?; fi\n" +
+            "    trap - INT TERM\n" +
+            "    exit \"$rc\"\n" +
+            "    ;;\n" +
+            "  transcribe)\n" +
+            "    file=\"\"\n" +
+            "    model=\"\"\n" +
+            "    language=\"\"\n" +
+            "    prompt=\"\"\n" +
+            "    usage_transcribe() { echo \"usage: tai transcribe <file.wav> [--model id] [--language xx] [--prompt words]\" >&2; exit 2; }\n" +
+            "    while [ \"$#\" -gt 0 ]; do\n" +
+            "      case \"$1\" in\n" +
+            "        --model) shift; [ \"$#\" -gt 0 ] || usage_transcribe; model=\"$1\" ;;\n" +
+            "        --language) shift; [ \"$#\" -gt 0 ] || usage_transcribe; language=\"$1\" ;;\n" +
+            "        --prompt) shift; [ \"$#\" -gt 0 ] || usage_transcribe; prompt=\"$1\" ;;\n" +
+            "        --*) usage_transcribe ;;\n" +
+            "        *) [ -z \"$file\" ] || usage_transcribe; file=\"$1\" ;;\n" +
+            "      esac\n" +
+            "      shift\n" +
+            "    done\n" +
+            "    [ -n \"$file\" ] || usage_transcribe\n" +
+            "    [ -r \"$file\" ] || { echo \"tai transcribe: cannot read $file\" >&2; exit 1; }\n" +
+            // The audio goes up as multipart/form-data, the OpenAI shape, so the same route serves
+            // curl, OpenAI clients and this script; text mode asks for the bare transcript.
+            "    set -- -F \"file=@$file\"\n" +
+            "    [ -z \"$model\" ] || set -- \"$@\" -F \"model=$model\"\n" +
+            "    [ -z \"$language\" ] || set -- \"$@\" -F \"language=$language\"\n" +
+            "    [ -z \"$prompt\" ] || set -- \"$@\" -F \"prompt=$prompt\"\n" +
+            "    if [ \"$OUTPUT_MODE\" = \"text\" ]; then set -- \"$@\" -F \"response_format=text\" -H \"X-TAI-Output: text\"; fi\n" +
+            "    curl $CURL_COMMON -X POST -H \"Authorization: Bearer $TOKEN\" \"$@\" \"$BASE/v1/audio/transcriptions\"\n" +
+            "    ;;\n" +
+            "  speak)\n" +
+            "    voice=\"\"\n" +
+            "    speed=\"\"\n" +
+            "    model=\"\"\n" +
+            "    out=\"\"\n" +
+            "    stream=0\n" +
+            "    whole=0\n" +
+            "    usage_speak() { echo \"usage: tai speak [--voice Bruno|Hugo|Jasper|Rosie] [--speed N] [--out file.wav] [--whole|--stream] [text...]  (reads stdin when no text is given and speaks piped lines as they arrive; tai speak --stop stops)\" >&2; exit 2; }\n" +
+            "    while [ \"$#\" -gt 0 ]; do\n" +
+            "      case \"$1\" in\n" +
+            "        --voice) shift; [ \"$#\" -gt 0 ] || usage_speak; voice=\"$1\" ;;\n" +
+            "        --speed) shift; [ \"$#\" -gt 0 ] || usage_speak; speed=\"$1\" ;;\n" +
+            "        --model) shift; [ \"$#\" -gt 0 ] || usage_speak; model=\"$1\" ;;\n" +
+            "        --out|-o) shift; [ \"$#\" -gt 0 ] || usage_speak; out=\"$1\" ;;\n" +
+            "        --stream) stream=1 ;;\n" +
+            "        --whole) whole=1 ;;\n" +
+            "        --stop) post_json /v1/ai/speak/stop '{}'; exit $? ;;\n" +
+            "        --) shift; break ;;\n" +
+            "        -*) usage_speak ;;\n" +
+            "        *) break ;;\n" +
+            "      esac\n" +
+            "      shift\n" +
+            "    done\n" +
+            "    case \"$voice$model\" in *[!A-Za-z0-9._-]*) echo \"tai speak: voice and model are plain names\" >&2; exit 2 ;; esac\n" +
+            "    case \"$speed\" in *[!0-9.]*) echo \"tai speak: --speed takes a number such as 1.2\" >&2; exit 2 ;; esac\n" +
+            "    # The text goes up as a plain-text body, so it never has to be escaped into JSON; the options\n" +
+            "    # ride as query parameters.\n" +
+            "    query=\"\"\n" +
+            "    add_query() { if [ -z \"$query\" ]; then query=\"?$1\"; else query=\"$query&$1\"; fi; }\n" +
+            "    [ -z \"$voice\" ] || add_query \"voice=$voice\"\n" +
+            "    [ -z \"$speed\" ] || add_query \"speed=$speed\"\n" +
+            "    [ -z \"$model\" ] || add_query \"model=$model\"\n" +
+            "    [ -z \"$out\" ] || add_query \"format=wav\"\n" +
+            "    CURL_SPEAK=\"--fail-with-body -sS --connect-timeout 2 --max-time 3600\"\n" +
+            "    # Piped input is spoken as it arrives; --whole collects it first, --out needs the whole text.\n" +
+            "    if [ \"$stream\" = \"1\" ]; then\n" +
+            "      { [ \"$whole\" = \"0\" ] && [ -z \"$out\" ] && [ \"$#\" -eq 0 ]; } || usage_speak\n" +
+            "    elif [ \"$whole\" = \"0\" ] && [ -z \"$out\" ] && [ \"$#\" -eq 0 ] && [ ! -t 0 ]; then\n" +
+            "      stream=1\n" +
+            "    fi\n" +
+            "    if [ \"$stream\" = \"1\" ]; then\n" +
+            "      # One line in, sentences out: drop colour codes and carriage returns, drop markdown marks that\n" +
+            "      # would be read aloud, collapse spaces, then break after . ! ? (and closing quotes or brackets).\n" +
+            "      speak_sed='s/\\r//g\n" +
+            "s/\\x1b\\][^\\x07]*(\\x07|\\x1b\\\\)//g\n" +
+            "s/\\x1b\\[[0-9;:?<>=! ]*[A-Za-z@]//g\n" +
+            "s/\\x1b.//g\n" +
+            "s/\\*\\*//g\n" +
+            "s/__//g\n" +
+            "s/`//g\n" +
+            "s/[[:space:]]+/ /g\n" +
+            "s/^ //\n" +
+            "s/ $//\n" +
+            "s/^#+ +//\n" +
+            "s/^[-*+>] +//\n" +
+            "s/^([0-9]+)[.)] +/\\1, /\n" +
+            "s/([.!?][]\\x22\\x27)]*) /\\1\\n/g'\n" +
+            "      trap 'post_json /v1/ai/speak/stop \"{}\" >/dev/null 2>&1; exit 130' INT TERM\n" +
+            "      if [ \"$OUTPUT_MODE\" = \"text\" ]; then set -- -H \"X-TAI-Output: text\"; else set --; fi\n" +
+            "      while IFS= read -r line || [ -n \"$line\" ]; do\n" +
+            "        parts=$(printf '%s\\n' \"$line\" | sed -E -e \"$speak_sed\") || parts=\"\"\n" +
+            "        while IFS= read -r sentence || [ -n \"$sentence\" ]; do\n" +
+            "          case \"$sentence\" in *[[:alnum:]]*) ;; *) continue ;; esac\n" +
+            "          # Each request returns once its sentence has been heard, which keeps the order.\n" +
+            "          if body=$(printf '%s' \"$sentence\" | curl $CURL_SPEAK -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: text/plain; charset=utf-8\" \"$@\" --data-binary @- \"$BASE/v1/ai/speak$query\"); then\n" +
+            "            :\n" +
+            "          else\n" +
+            "            rc=$?\n" +
+            "            printf '%s\\n' \"$body\" >&2\n" +
+            "            trap - INT TERM\n" +
+            "            exit \"$rc\"\n" +
+            "          fi\n" +
+            "        done <<SPEAK_EOF\n" +
+            "$parts\n" +
+            "SPEAK_EOF\n" +
+            "      done\n" +
+            "      trap - INT TERM\n" +
+            "      exit 0\n" +
+            "    fi\n" +
+            "    tmp=$(mktemp \"${TMPDIR:-$HOME}/tai-speak.XXXXXX\") || exit 1\n" +
+            "    if [ \"$#\" -gt 0 ]; then printf '%s' \"$*\" > \"$tmp\"; else cat > \"$tmp\"; fi\n" +
+            "    [ -s \"$tmp\" ] || { rm -f \"$tmp\"; usage_speak; }\n" +
+            "    if [ -n \"$out\" ]; then\n" +
+            "      if curl $CURL_SPEAK -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: text/plain; charset=utf-8\" --data-binary \"@$tmp\" -o \"$out.part\" \"$BASE/v1/ai/speak$query\"; then\n" +
+            "        mv -f \"$out.part\" \"$out\"\n" +
+            "        rm -f \"$tmp\"\n" +
+            "        [ \"$OUTPUT_MODE\" = \"json\" ] && printf '{\"ok\":true,\"file\":\"%s\"}\\n' \"$out\" || echo \"Saved $out\"\n" +
+            "        exit 0\n" +
+            "      fi\n" +
+            "      rc=$?\n" +
+            "      cat \"$out.part\" >&2 2>/dev/null || true\n" +
+            "      echo >&2\n" +
+            "      rm -f \"$out.part\" \"$tmp\"\n" +
+            "      exit \"$rc\"\n" +
+            "    fi\n" +
+            "    # Ctrl-C stops the voice too, not just this command.\n" +
+            "    trap 'post_json /v1/ai/speak/stop \"{}\" >/dev/null 2>&1; rm -f \"$tmp\"; exit 130' INT TERM\n" +
+            "    if [ \"$OUTPUT_MODE\" = \"text\" ]; then set -- -H \"X-TAI-Output: text\"; else set --; fi\n" +
+            "    if curl $CURL_SPEAK -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: text/plain; charset=utf-8\" \"$@\" --data-binary \"@$tmp\" \"$BASE/v1/ai/speak$query\"; then rc=0; else rc=$?; fi\n" +
+            "    trap - INT TERM\n" +
+            "    rm -f \"$tmp\"\n" +
+            "    exit \"$rc\"\n" +
+            "    ;;\n" +
+            "  image)\n" +
+            "    model=\"\"\n" +
+            "    model_dir=\"\"\n" +
+            "    model_type=\"\"\n" +
+            "    out=\"\"\n" +
+            "    steps=\"\"\n" +
+            "    seed=\"\"\n" +
+            "    size=\"\"\n" +
+            "    cfg=\"\"\n" +
+            "    input=\"\"\n" +
+            "    backend=\"\"\n" +
+            "    memory_mode=\"\"\n" +
+            "    usage_image() { echo \"usage: tai image \\\"prompt\\\" [--model ID | --model-dir DIR] [--type sd15|taiyi|sana] [--out FILE.png] [--steps N] [--seed N] [--size WxH] [--cfg X] [--image IN.png] [--cpu] [--memory-mode 0|1|2]  (reads the prompt from stdin when none is given; tai image --stop cancels)\" >&2; exit 2; }\n" +
+            "    abs_path() { case \"$1\" in /*) printf '%s' \"$1\" ;; *) printf '%s/%s' \"$(pwd)\" \"$1\" ;; esac; }\n" +
+            "    while [ \"$#\" -gt 0 ]; do\n" +
+            "      case \"$1\" in\n" +
+            "        --model) shift; [ \"$#\" -gt 0 ] || usage_image; model=\"$1\" ;;\n" +
+            "        --model-dir) shift; [ \"$#\" -gt 0 ] || usage_image; model_dir=$(abs_path \"$1\") ;;\n" +
+            "        --type) shift; [ \"$#\" -gt 0 ] || usage_image; model_type=\"$1\" ;;\n" +
+            "        --out|-o) shift; [ \"$#\" -gt 0 ] || usage_image; out=$(abs_path \"$1\") ;;\n" +
+            "        --steps) shift; [ \"$#\" -gt 0 ] || usage_image; steps=\"$1\" ;;\n" +
+            "        --seed) shift; [ \"$#\" -gt 0 ] || usage_image; seed=\"$1\" ;;\n" +
+            "        --size) shift; [ \"$#\" -gt 0 ] || usage_image; size=\"$1\" ;;\n" +
+            "        --cfg) shift; [ \"$#\" -gt 0 ] || usage_image; cfg=\"$1\" ;;\n" +
+            "        --image) shift; [ \"$#\" -gt 0 ] || usage_image; input=$(abs_path \"$1\") ;;\n" +
+            "        --cpu) backend=cpu ;;\n" +
+            "        --memory-mode) shift; [ \"$#\" -gt 0 ] || usage_image; memory_mode=\"$1\" ;;\n" +
+            "        --stop) post_json /v1/ai/images/cancel '{}'; exit $? ;;\n" +
+            "        --) shift; break ;;\n" +
+            "        -*) usage_image ;;\n" +
+            "        *) break ;;\n" +
+            "      esac\n" +
+            "      shift\n" +
+            "    done\n" +
+            "    case \"$steps$seed$memory_mode\" in *[!0-9-]*) echo \"tai image: --steps, --seed and --memory-mode take whole numbers\" >&2; exit 2 ;; esac\n" +
+            "    case \"$cfg\" in *[!0-9.]*) echo \"tai image: --cfg takes a number such as 4.5\" >&2; exit 2 ;; esac\n" +
+            "    case \"$size\" in ''|[0-9]*x[0-9]*) ;; *) echo \"tai image: --size looks like 512x512\" >&2; exit 2 ;; esac\n" +
+            "    case \"$model_type\" in ''|sd15|taiyi|sana) ;; *) echo \"tai image: --type is sd15, taiyi or sana\" >&2; exit 2 ;; esac\n" +
+            "    case \"$memory_mode\" in ''|0|1|2) ;; *) echo \"tai image: --memory-mode is 0, 1 or 2\" >&2; exit 2 ;; esac\n" +
+            "    if [ \"$#\" -gt 0 ]; then prompt=\"$*\"; else prompt=$(cat); fi\n" +
+            "    prompt=$(printf '%s' \"$prompt\" | tr '\\n\\t' '  ')\n" +
+            "    [ -n \"$prompt\" ] || usage_image\n" +
+            "    [ -z \"$model\" ] || [ -z \"$model_dir\" ] || { echo \"tai image: give --model or --model-dir, not both\" >&2; exit 2; }\n" +
+            "    [ -n \"$model$model_dir\" ] || { echo \"tai image: name a model with --model ID, or a folder with --model-dir DIR\" >&2; exit 2; }\n" +
+            "    [ -n \"$out\" ] || out=\"$(pwd)/tai-image-$(date +%Y%m%d-%H%M%S).png\"\n" +
+            "    body=\"{\\\"prompt\\\":\\\"$(json_escape \"$prompt\")\\\",\\\"output\\\":\\\"$(json_escape \"$out\")\\\"\"\n" +
+            "    [ -z \"$model\" ] || body=\"$body,\\\"model\\\":\\\"$(json_escape \"$model\")\\\"\"\n" +
+            "    [ -z \"$model_dir\" ] || body=\"$body,\\\"model_path\\\":\\\"$(json_escape \"$model_dir\")\\\"\"\n" +
+            "    [ -z \"$model_type\" ] || body=\"$body,\\\"model_type\\\":\\\"$model_type\\\"\"\n" +
+            "    [ -z \"$steps\" ] || body=\"$body,\\\"steps\\\":$steps\"\n" +
+            "    [ -z \"$seed\" ] || body=\"$body,\\\"seed\\\":$seed\"\n" +
+            "    [ -z \"$size\" ] || body=\"$body,\\\"size\\\":\\\"$size\\\"\"\n" +
+            "    [ -z \"$cfg\" ] || body=\"$body,\\\"cfg_scale\\\":$cfg\"\n" +
+            "    [ -z \"$input\" ] || body=\"$body,\\\"image\\\":\\\"$(json_escape \"$input\")\\\"\"\n" +
+            "    [ -z \"$backend\" ] || body=\"$body,\\\"backend\\\":\\\"$backend\\\"\"\n" +
+            "    [ -z \"$memory_mode\" ] || body=\"$body,\\\"memory_mode\\\":$memory_mode\"\n" +
+            "    # A run lasts from seconds to minutes (the first OpenCL load tunes its kernels). The engine cannot\n" +
+            "    # stop mid-run: Ctrl-C asks the runtime to discard the result and this command leaves at once.\n" +
+            "    CURL_IMAGE=\"--fail-with-body -sS --connect-timeout 2 --max-time 7200\"\n" +
+            "    trap 'post_json /v1/ai/images/cancel \"{}\" >/dev/null 2>&1; exit 130' INT TERM\n" +
+            "    if [ \"$OUTPUT_MODE\" = \"text\" ]; then\n" +
+            "      marker=$(mktemp \"${TMPDIR:-$HOME}/tai-image.XXXXXX\") || exit 1\n" +
+            "      body=\"$body,\\\"stream\\\":true}\"\n" +
+            "      curl $CURL_IMAGE -N -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" -H \"X-TAI-Output: text\" --data \"$body\" \"$BASE/v1/ai/images/generations\" 2>&1 | while IFS= read -r line; do\n" +
+            "        case \"$line\" in\n" +
+            "          \"progress \"*) printf '\\rGenerating... %s%%' \"${line#progress }\" >&2 ;;\n" +
+            "          \"done \"*) printf '\\n' >&2; printf 'Saved %s\\n' \"${line#done }\"; echo ok > \"$marker\" ;;\n" +
+            "          \"info \"*) ;;\n" +
+            "          \"error \"*) printf '\\n' >&2; echo \"tai image: ${line#error }\" >&2 ;;\n" +
+            "          *) [ -z \"$line\" ] || echo \"tai image: $line\" >&2 ;;\n" +
+            "        esac\n" +
+            "      done\n" +
+            "      if [ -s \"$marker\" ]; then rc=0; else rc=1; fi\n" +
+            "      rm -f \"$marker\"\n" +
+            "    else\n" +
+            "      body=\"$body}\"\n" +
+            "      if curl $CURL_IMAGE -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" --data \"$body\" \"$BASE/v1/ai/images/generations\"; then rc=0; else rc=$?; fi\n" +
+            "    fi\n" +
+            "    trap - INT TERM\n" +
+            "    exit \"$rc\"\n" +
+            "    ;;\n" +
             "  doctor)\n" +
             "    get_json /v1/ai/runtime\n" +
             "    ;;\n" +
@@ -1740,13 +2919,39 @@ public class LauncherCtlApiServer {
             "    exit 2\n" +
             "    ;;\n" +
             "esac\n";
+    }
 
-        // launcherctl is the shell companion: `launcherctl launch` for tmux configs and shell binds,
-        // and `launcherctl pane …` so a process in a shell — an agent, a build, a script — can open
-        // a pane of its own to show its work in and drive it. Everything else was stripped with the
-        // agent/MCP endpoints and stays gone.
-        String launcherctlScript =
-            "#!" + TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/sh\n" +
+    private void installTaiCliScripts() {
+        File loginBinary = new File(TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/login");
+        if (!loginBinary.exists()) {
+            Logger.logInfo(LOG_TAG, "Skipping TAI CLI install until bootstrap is initialized.");
+            return;
+        }
+
+        String taiScript = taiCliScript(TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH);
+        String launcherctlScript = launcherctlCliScript(TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH);
+
+        try {
+            writeExecutableTextFile(TAI_BIN_PATH, taiScript);
+            writeExecutableTextFile(LAUNCHERCTL_BIN_PATH, launcherctlScript);
+            deleteLegacyHelperScripts();
+        } catch (Exception e) {
+            Logger.logErrorExtended(LOG_TAG, "Failed to install TAI cli: " + e.getMessage());
+        }
+    }
+
+    /**
+     * The {@code launcherctl} script: the shell companion. {@code launcherctl launch} for tmux
+     * configs and shell binds, and {@code launcherctl pane …} / {@code window …} so a process in
+     * a shell (an agent, a build, a script) can open a pane of its own, show its work in it and
+     * drive it, plus the signals and device groups. Everything else was stripped with the
+     * agent/MCP endpoints and stays gone. Each group answers {@code launcherctl <group> --help};
+     * pane wait's limits are {@link PaneWait}'s own numbers, so the script and the server can
+     * never disagree on them.
+     */
+    static String launcherctlCliScript(String binPrefixDir) {
+        return
+            "#!" + binPrefixDir + "/sh\n" +
             "set -eu\n" +
             "print_help() {\n" +
             "  cat <<'EOF'\n" +
@@ -1754,34 +2959,298 @@ public class LauncherCtlApiServer {
             "\n" +
             "Usage:\n" +
             "  launcherctl launch <app name, package, or activity>\n" +
-            "  launcherctl pane open [--cwd DIR] [--title NAME] [--tag TAG] [--no-focus] [--] [CMD ARGS...]\n" +
-            "  launcherctl pane list\n" +
+            "  launcherctl pane open [--cwd DIR] [--title NAME] [--tag TAG] [--no-focus] [--print-id]\n" +
+            "                        [--from ID] [--direction right|left|down|up]\n" +
+            "                        [--size 0.1-0.9 | --columns N | --rows N] [--] [CMD ARGS...]\n" +
+            "  launcherctl pane current | get <id> | list\n" +
             "  launcherctl pane focus <id>\n" +
+            "  launcherctl pane resize <id> --size 0.1-0.9 | --columns N | --rows N\n" +
             "  launcherctl pane write <id> [--enter] <text> | launcherctl pane write <id> [--enter] < file\n" +
             "  launcherctl pane read <id> [--lines N]\n" +
+            "  launcherctl pane wait <id> (--match TEXT | --regex RE) [--timeout MS] [--lines N]\n" +
             "  launcherctl pane close <id>\n" +
+            "  launcherctl window open [--cwd DIR] [--title NAME] [--no-focus] [--print-id] [--] CMD ARGS...\n" +
+            "  launcherctl window list\n" +
+            "  launcherctl window focus <id>\n" +
+            "  launcherctl window close <id>\n" +
             "  launcherctl agent working|blocked|idle|clear [--agent NAME] [--pane ID]\n" +
             "  launcherctl agent install-hooks\n" +
-            "  launcherctl keyboard show|hide [--source manual|focus]\n" +
+            "  launcherctl notify [--title T] [--id ID] [--urgency low|normal|critical] [--pane ID] <body> | ... < file\n" +
+            "  launcherctl notify --close ID [--pane ID]\n" +
+            "  launcherctl progress <0-100|clear|error [PCT]|indeterminate|paused [PCT]> [--pane ID]\n" +
+            "  launcherctl clipboard copy [<text>] | launcherctl clipboard copy < file\n" +
+            "  launcherctl clipboard paste\n" +
+            "  launcherctl notifications [--app PKG|LABEL] [--since 7d|ISO] [--until 1d|ISO] [--query TEXT] [--limit N] [--json]\n" +
+            "  launcherctl notifications apps|active [--json]\n" +
+            "  launcherctl notifications clear [--app PKG|LABEL]\n" +
+            "  launcherctl keyboard show|hide [--source manual|focus] [--hold]\n" +
+            "  launcherctl vibrate [-d MS] [--force]\n" +
+            "  launcherctl torch on|off\n" +
+            "  launcherctl battery\n" +
+            "  launcherctl volume [STREAM VALUE]\n" +
+            "  launcherctl toast [--short] <text>\n" +
+            "  launcherctl wallpaper set FILE [--home|--lock|--both]\n" +
+            "  launcherctl wallpaper get\n" +
             "  launcherctl x11 gpu [--env]\n" +
+            "\n" +
+            "Each group explains its commands and flags: launcherctl <group> --help, for launch, pane,\n" +
+            "window, agent, notify, progress, clipboard, notifications, keyboard, vibrate, torch,\n" +
+            "battery, volume, toast, wallpaper and x11.\n" +
             "\n" +
             "Examples:\n" +
             "  launcherctl launch whatsapp\n" +
-            "  id=$(launcherctl pane open --title preview --no-focus -- kitten icat out.png | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n" +
+            "  launcherctl pane current                 # this pane: its window, size and place\n" +
+            "  id=$(launcherctl pane open --print-id --title tests --no-focus)\n" +
             "  launcherctl pane write \"$id\" --enter 'make test'\n" +
+            "  launcherctl pane wait \"$id\" --regex 'passed|failed' --timeout 120000\n" +
             "  launcherctl pane read \"$id\" --lines 40\n" +
+            "  launcherctl pane close \"$id\"\n" +
+            "  launcherctl pane open --direction right --size 0.4 --no-focus -- htop   # beside this pane\n" +
+            "  id=$(launcherctl window open --print-id --title tlstore --no-focus -- tlstore)\n" +
+            "  launcherctl notify --title Build '42 tests passed'   # the phone's notification shade\n" +
+            "  launcherctl progress 42; launcherctl progress clear  # the ring on this window's chip\n" +
+            "  git diff | launcherctl clipboard copy               # onto the Android clipboard\n" +
             "  launcherctl keyboard show --source focus   # a text field took focus\n" +
+            "  launcherctl keyboard hide --hold            # keep it down until this asks again\n" +
             "\n" +
-            "A pane opened here belongs to the opener: write, read and close only work on panes\n" +
-            "opened through this command; list and focus work on every pane. Output is JSON.\n" +
-            "\n" +
-            "launcherctl agent tells the window chips and the sessions browser what the AI coding\n" +
-            "agent in this pane is doing, so a pane that needs an answer is visible from anywhere;\n" +
-            "it reports for $TERMUX_LAUNCHER_PANE unless --pane says otherwise, and\n" +
-            "`launcherctl agent install-hooks` wires the four Claude Code hooks that send it into\n" +
-            "~/.claude/settings.json, leaving every hook already there alone.\n" +
+            "Output is JSON unless a flag asks for something else. When the launcher refuses a\n" +
+            "command, its JSON answer (with an error code such as not_owned or pane_not_found) is\n" +
+            "printed and the exit status is 1; a mistake in the command line itself exits 2.\n" +
             "For local AI, use: tai --help\n" +
             "EOF\n" +
+            "}\n" +
+            "# group_help GROUP: one group's commands, flags and what they do; false for an unknown group.\n" +
+            "group_help() {\n" +
+            "  case \"$1\" in\n" +
+            "    launch) cat <<'EOF'\n" +
+            "launcherctl launch - open an app\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl launch <app name, package, or activity>\n" +
+            "\n" +
+            "Opens an Android app, matched by name, package or activity; exact matches rank first.\n" +
+            "A Linux app from the drawer opens on the Linux display.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    pane) cat <<'EOF'\n" +
+            "launcherctl pane - open, inspect, drive, wait on and close panes\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl pane open [options] [--] [CMD ARGS...]\n" +
+            "  launcherctl pane current\n" +
+            "  launcherctl pane get <id>\n" +
+            "  launcherctl pane list\n" +
+            "  launcherctl pane focus <id>\n" +
+            "  launcherctl pane resize <id> --size 0.1-0.9 | --columns N | --rows N\n" +
+            "  launcherctl pane write <id> [--enter] <text>       (no text: reads stdin)\n" +
+            "  launcherctl pane read <id> [--lines N]\n" +
+            "  launcherctl pane wait <id> (--match TEXT | --regex RE) [--timeout MS] [--lines N]\n" +
+            "  launcherctl pane close <id>\n" +
+            "\n" +
+            "pane open splits a pane and prints the new one. CMD runs there in your login shell,\n" +
+            "which stays when CMD ends.\n" +
+            "  --cwd DIR              start in DIR (default: the directory this command runs in)\n" +
+            "  --title NAME           name the pane\n" +
+            "  --tag TAG              a label kept with the pane, shown by list and get\n" +
+            "  --no-focus             leave the focus where it is\n" +
+            "  --print-id             print only the new pane's id, one line, instead of JSON\n" +
+            "  --from ID              split pane ID (default: $TERMUX_LAUNCHER_PANE, the pane this\n" +
+            "                         runs in, else the focused pane)\n" +
+            "  --direction SIDE       put the new pane right, left, down or up of it (or --split)\n" +
+            "  --size 0.1-0.9         the new pane's share of the pane it splits\n" +
+            "  --columns N, --rows N  its width or height in cells instead\n" +
+            "\n" +
+            "pane current prints the pane this runs in ($TERMUX_LAUNCHER_PANE) the way pane get\n" +
+            "prints any pane of the current session: which window holds it, whether it floats,\n" +
+            "its size in columns and rows, its place in cells, whether it has the focus, and its\n" +
+            "window and that window's layout. pane list prints every window and pane of the\n" +
+            "current session, and features: what this launcher's pane commands can do.\n" +
+            "\n" +
+            "write, read, wait, resize and close only work on panes opened through pane open or\n" +
+            "window open; current, get, list and focus work on every pane. write types the text;\n" +
+            "--enter presses Enter after it. read prints the last N lines (default 60, at most 500).\n" +
+            "\n" +
+            "pane wait returns as soon as one of the pane's last N lines (default 60) contains\n" +
+            "TEXT, or matches the regular expression RE (Java syntax), and output already there\n" +
+            "counts. It prints that line as .text. It gives up after --timeout milliseconds\n" +
+            "(default " + PaneWait.DEFAULT_TIMEOUT_MS + ", at most " + PaneWait.MAX_TIMEOUT_MS + ") with the error timeout, or with\n" +
+            "pane_not_running when the pane's shell ends first; both exit 1. A timeout does not\n" +
+            "mean the command did not run: read the pane before running it again.\n" +
+            "\n" +
+            "JSON paths: .pane.id, .pane.window, .pane.floating, .pane.columns, .pane.rows,\n" +
+            ".pane.geometry (left, top, columns, rows), .pane.focused, .window, .layout; for list\n" +
+            ".windows[].panes[] and .features. With jq installed:\n" +
+            "  launcherctl pane current | jq .pane.geometry\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    window) cat <<'EOF'\n" +
+            "launcherctl window - open, list, focus and close windows\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl window open [--cwd DIR] [--title NAME] [--no-focus] [--print-id] [--] CMD ARGS...\n" +
+            "  launcherctl window list\n" +
+            "  launcherctl window focus <id>\n" +
+            "  launcherctl window close <id>\n" +
+            "\n" +
+            "A window is a whole new full-size window with its own chip, not a pane sharing the\n" +
+            "one on screen. window open runs CMD in one, and needs a command:\n" +
+            "  --cwd DIR      start in DIR (default: the directory this command runs in)\n" +
+            "  --title NAME   name the window's chip\n" +
+            "  --no-focus     leave the current window up front; the new one runs behind it\n" +
+            "  --print-id     print only the new window's pane id, one line, instead of JSON\n" +
+            "The window closes when CMD exits. Its JSON has .pane (the new pane's id, which the\n" +
+            "pane commands take) and .windowId (the id window focus and close take).\n" +
+            "\n" +
+            "window list prints the same JSON as pane list. window focus takes a window id from\n" +
+            "the list, or the id of any pane in it, and works on any window; window close only on\n" +
+            "one opened here.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    agent) cat <<'EOF'\n" +
+            "launcherctl agent - say what the AI coding agent in this pane is doing\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl agent working|blocked|idle|clear [--agent NAME] [--pane ID]\n" +
+            "  launcherctl agent install-hooks\n" +
+            "\n" +
+            "The state shows on the window chips and in the sessions browser, so a pane that needs\n" +
+            "an answer is visible from anywhere. It is reported for $TERMUX_LAUNCHER_PANE unless\n" +
+            "--pane says otherwise; --agent names the agent; clear hands the pane back to the\n" +
+            "screen's own reading. install-hooks wires the four Claude Code hooks that send it into\n" +
+            "~/.claude/settings.json, leaving every hook already there alone.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    notify) cat <<'EOF'\n" +
+            "launcherctl notify - a notification in the phone's shade\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl notify [--title T] [--id ID] [--urgency low|normal|critical] [--pane ID] <body>\n" +
+            "  launcherctl notify [options] < file      (no body: reads stdin)\n" +
+            "  launcherctl notify --close ID [--pane ID]\n" +
+            "\n" +
+            "Does what the OSC 99 escape does, for a process with no terminal to write it into.\n" +
+            "A later notify with the same --id replaces it; --close takes it down. It goes to\n" +
+            "$TERMUX_LAUNCHER_PANE when that is set, to --pane when given, else to the current pane.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    progress) cat <<'EOF'\n" +
+            "launcherctl progress - the progress ring on this window's chip\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl progress <0-100|clear|error [PCT]|indeterminate|paused [PCT]> [--pane ID]\n" +
+            "\n" +
+            "Does what the OSC 9;4 escape does. clear takes the ring away; error and paused keep the\n" +
+            "last percentage unless given one. It goes to $TERMUX_LAUNCHER_PANE when that is set, to\n" +
+            "--pane when given, else to the current pane.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    clipboard) cat <<'EOF'\n" +
+            "launcherctl clipboard - the Android clipboard\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl clipboard copy [<text>]      (no text: reads stdin)\n" +
+            "  launcherctl clipboard paste\n" +
+            "\n" +
+            "copy does what the OSC 52 escape does. paste is only answered while the launcher is on\n" +
+            "screen and Settings > Terminal > Let programs read the clipboard is on.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    notifications) cat <<'EOF'\n" +
+            "launcherctl notifications - the history of other apps' notifications\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl notifications [--app PKG|LABEL] [--since 7d|ISO] [--until 1d|ISO] [--query TEXT] [--limit N] [--json]\n" +
+            "  launcherctl notifications apps|active [--json]\n" +
+            "  launcherctl notifications clear [--app PKG|LABEL]\n" +
+            "\n" +
+            "Reads the history of the apps the user enabled in the launcher's settings (none by\n" +
+            "default): newest first, one line per message as `time · app · title — text`, or JSON\n" +
+            "with --json. --since and --until take 90m, 12h, 7d, 2w or an ISO date; --app takes a\n" +
+            "package or part of the app's name. apps lists the recorded apps, active what is in the\n" +
+            "shade now. One-time codes are masked at write time unless that is switched off in\n" +
+            "settings.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    keyboard) cat <<'EOF'\n" +
+            "launcherctl keyboard - show or hide the on-screen keyboard\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl keyboard show|hide [--source manual|focus] [--hold]\n" +
+            "\n" +
+            "--source focus says a text field took or lost focus, which the launcher may weigh\n" +
+            "against its own rules; manual (the default) is the user asking. hide --hold keeps the\n" +
+            "keyboard down until this same shell shows it again or ends.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    vibrate) cat <<'EOF'\n" +
+            "launcherctl vibrate - vibrate the phone\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl vibrate [-d MS] [--force]\n" +
+            "\n" +
+            "Vibrates for MS milliseconds, 1000 by default and at most 10 seconds. Silent mode and\n" +
+            "the vibration setting apply unless --force is given.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    torch) cat <<'EOF'\n" +
+            "launcherctl torch - the camera flash\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl torch on|off\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    battery) cat <<'EOF'\n" +
+            "launcherctl battery - the battery state\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl battery\n" +
+            "\n" +
+            "Prints health, percentage, plugged, status, temperature (°C) and current\n" +
+            "(microamperes) as JSON, as termux-battery-status does.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    volume) cat <<'EOF'\n" +
+            "launcherctl volume - stream volumes\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl volume [STREAM VALUE]\n" +
+            "\n" +
+            "With no arguments, lists every stream with its volume and maximum. With a stream\n" +
+            "(alarm, music, notification, ring, system or call) and a whole number, sets it.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    toast) cat <<'EOF'\n" +
+            "launcherctl toast - a short message on screen\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl toast [--short] <text>       (no text: reads stdin)\n" +
+            "\n" +
+            "Long by default; --short for a brief one.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    wallpaper) cat <<'EOF'\n" +
+            "launcherctl wallpaper - the wallpaper\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl wallpaper set FILE [--home|--lock|--both]\n" +
+            "  launcherctl wallpaper get\n" +
+            "\n" +
+            "set makes a picture the wallpaper on the home screen, the lock screen or both (the\n" +
+            "default); get reports what is set now.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    x11) cat <<'EOF'\n" +
+            "launcherctl x11 - Linux apps on the display\n" +
+            "\n" +
+            "Usage:\n" +
+            "  launcherctl x11 gpu [--env]\n" +
+            "\n" +
+            "gpu says which graphics profile fits this phone and whether its packages are\n" +
+            "installed; --env prints the exports instead, ready to eval.\n" +
+            "EOF\n" +
+            "      ;;\n" +
+            "    *) return 1 ;;\n" +
+            "  esac\n" +
             "}\n" +
             "LAUNCHERCTL_DIR=\"$HOME/.launcherctl\"\n" +
             "TOKEN_FILE=\"$LAUNCHERCTL_DIR/token\"\n" +
@@ -1800,21 +3269,53 @@ public class LauncherCtlApiServer {
             "  sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/\\t/\\\\t/g; s/\\r/\\\\r/g' | sed ':a;N;$!ba;s/\\n/\\\\n/g' | tr -d '\\n'\n" +
             "  printf '\"'\n" +
             "}\n" +
+            "# Seconds curl gives one call; pane wait raises it past the wait it asks for.\n" +
+            "API_MAX_TIME=15\n" +
+            "# pane wait's default and ceiling in milliseconds, the same numbers the launcher enforces.\n" +
+            "WAIT_DEFAULT_MS=" + PaneWait.DEFAULT_TIMEOUT_MS + "\n" +
+            "WAIT_MAX_MS=" + PaneWait.MAX_TIMEOUT_MS + "\n" +
             "api() {\n" +
             "  # api METHOD PATH [BODY]: prints the JSON body, exits 1 on an HTTP error so the\n" +
             "  # error code in that body (not_owned, pane_not_found, ...) is never swallowed.\n" +
             "  need_server\n" +
             "  if [ \"$#\" -ge 3 ]; then\n" +
-            "    out=$(curl -sS --connect-timeout 2 --max-time 15 -X \"$1\" -w '\\n%{http_code}' \\\n" +
+            "    out=$(curl -sS --connect-timeout 2 --max-time \"$API_MAX_TIME\" -X \"$1\" -w '\\n%{http_code}' \\\n" +
             "      -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" \\\n" +
             "      --data \"$3\" \"$BASE$2\")\n" +
             "  else\n" +
-            "    out=$(curl -sS --connect-timeout 2 --max-time 15 -X \"$1\" -w '\\n%{http_code}' \\\n" +
+            "    out=$(curl -sS --connect-timeout 2 --max-time \"$API_MAX_TIME\" -X \"$1\" -w '\\n%{http_code}' \\\n" +
             "      -H \"Authorization: Bearer $TOKEN\" \"$BASE$2\")\n" +
             "  fi\n" +
             "  code=$(printf '%s\\n' \"$out\" | tail -n 1)\n" +
             "  printf '%s\\n' \"$out\" | sed '$d'\n" +
             "  [ \"$code\" -lt 400 ] 2>/dev/null\n" +
+            "}\n" +
+            "# api_print METHOD PATH BODY: api, printed through a variable so a one-line text answer\n" +
+            "# (--print-id) comes out as exactly that line; exits 1 on an error, like api.\n" +
+            "api_print() {\n" +
+            "  if out=$(api \"$@\"); then\n" +
+            "    printf '%s\\n' \"$out\"\n" +
+            "  else\n" +
+            "    [ -z \"$out\" ] || printf '%s\\n' \"$out\"\n" +
+            "    exit 1\n" +
+            "  fi\n" +
+            "}\n" +
+            "# need_value COUNT FLAG: a usage error unless FLAG, with COUNT arguments left from it on,\n" +
+            "# has a value after it.\n" +
+            "need_value() {\n" +
+            "  [ \"$1\" -ge 2 ] || { echo \"launcherctl: $2 needs a value\" >&2; exit 2; }\n" +
+            "}\n" +
+            "# need_id USAGE ID: a usage error unless ID looks like a pane or window id, so a missing or\n" +
+            "# mangled one can never reach the launcher as some other request.\n" +
+            "need_id() {\n" +
+            "  case \"$2\" in\n" +
+            "    ''|-*|*[!A-Za-z0-9_.-]*) echo \"$1\" >&2; exit 2 ;;\n" +
+            "  esac\n" +
+            "}\n" +
+            "# no_zeros N: N without leading zeros (0 stays 0), so the shell never reads it as octal.\n" +
+            "no_zeros() {\n" +
+            "  n=\"${1#\"${1%%[!0]*}\"}\"\n" +
+            "  printf '%s' \"${n:-0}\"\n" +
             "}\n" +
             "agent_cmd() {\n" +
             "  sub=\"${1:-}\"\n" +
@@ -1846,16 +3347,25 @@ public class LauncherCtlApiServer {
             "}\n" +
             "pane_cmd() {\n" +
             "  sub=\"${1:-}\"\n" +
-            "  [ -n \"$sub\" ] && shift || { print_help >&2; exit 2; }\n" +
+            "  [ -n \"$sub\" ] && shift || { group_help pane >&2; exit 2; }\n" +
+            "  case \"${1:-}\" in -h|--help) group_help pane; exit 0 ;; esac\n" +
             "  case \"$sub\" in\n" +
             "    open)\n" +
-            "      cwd= title= tag= focus=true\n" +
+            "      # Without --cwd the pane starts where this command runs, as a split in tmux or kitty\n" +
+            "      # does; the launcher's own default is the home directory.\n" +
+            "      cwd=\"${PWD:-}\" title= tag= focus=true from= direction= size= columns= rows= print=\n" +
             "      while [ \"$#\" -gt 0 ]; do\n" +
             "        case \"$1\" in\n" +
-            "          --cwd) cwd=\"$2\"; shift 2 ;;\n" +
-            "          --title) title=\"$2\"; shift 2 ;;\n" +
-            "          --tag) tag=\"$2\"; shift 2 ;;\n" +
+            "          --cwd) need_value \"$#\" \"$1\"; cwd=\"$2\"; shift 2 ;;\n" +
+            "          --title) need_value \"$#\" \"$1\"; title=\"$2\"; shift 2 ;;\n" +
+            "          --tag) need_value \"$#\" \"$1\"; tag=\"$2\"; shift 2 ;;\n" +
             "          --no-focus) focus=false; shift ;;\n" +
+            "          --print-id) print=id; shift ;;\n" +
+            "          --from) need_value \"$#\" \"$1\"; from=\"$2\"; shift 2 ;;\n" +
+            "          --direction|--split) need_value \"$#\" \"$1\"; direction=\"$2\"; shift 2 ;;\n" +
+            "          --size) need_value \"$#\" \"$1\"; size=\"$2\"; shift 2 ;;\n" +
+            "          --columns) need_value \"$#\" \"$1\"; columns=\"$2\"; shift 2 ;;\n" +
+            "          --rows) need_value \"$#\" \"$1\"; rows=\"$2\"; shift 2 ;;\n" +
             "          --) shift; break ;;\n" +
             "          -*) echo \"launcherctl pane open: unknown option $1\" >&2; exit 2 ;;\n" +
             "          *) break ;;\n" +
@@ -1865,6 +3375,13 @@ public class LauncherCtlApiServer {
             "      [ -n \"$cwd\" ] && body=\"$body,\\\"cwd\\\":$(printf '%s' \"$cwd\" | json_str)\"\n" +
             "      [ -n \"$title\" ] && body=\"$body,\\\"title\\\":$(printf '%s' \"$title\" | json_str)\"\n" +
             "      [ -n \"$tag\" ] && body=\"$body,\\\"tag\\\":$(printf '%s' \"$tag\" | json_str)\"\n" +
+            "      # The launcher answers with the new pane's id alone, as text, instead of the JSON.\n" +
+            "      [ -n \"$print\" ] && body=\"$body,\\\"print\\\":\\\"id\\\"\"\n" +
+            "      # Numbers go as strings: the server parses them, so a typo is a clear 400, not bad JSON.\n" +
+            "      [ -n \"$direction\" ] && body=\"$body,\\\"direction\\\":$(printf '%s' \"$direction\" | json_str)\"\n" +
+            "      [ -n \"$size\" ] && body=\"$body,\\\"size\\\":$(printf '%s' \"$size\" | json_str)\"\n" +
+            "      [ -n \"$columns\" ] && body=\"$body,\\\"columns\\\":$(printf '%s' \"$columns\" | json_str)\"\n" +
+            "      [ -n \"$rows\" ] && body=\"$body,\\\"rows\\\":$(printf '%s' \"$rows\" | json_str)\"\n" +
             "      if [ \"$#\" -gt 0 ]; then\n" +
             "        argv=\n" +
             "        for a in \"$@\"; do\n" +
@@ -1872,17 +3389,56 @@ public class LauncherCtlApiServer {
             "        done\n" +
             "        body=\"$body,\\\"command\\\":[$argv]\"\n" +
             "      fi\n" +
-            "      api POST /v1/panes \"$body}\"\n" +
+            "      if [ -n \"$from\" ]; then\n" +
+            "        api_print POST /v1/panes \"$body,\\\"from\\\":$(printf '%s' \"$from\" | json_str)}\"\n" +
+            "        return\n" +
+            "      fi\n" +
+            "      # Without --from the new pane splits the pane this runs in. When that pane cannot be\n" +
+            "      # split (another session's, or a floating one) nothing was opened, so ask again for\n" +
+            "      # the focused pane, as before --from existed.\n" +
+            "      if [ -n \"${TERMUX_LAUNCHER_PANE:-}\" ]; then\n" +
+            "        if out=$(api POST /v1/panes \"$body,\\\"from\\\":$(printf '%s' \"$TERMUX_LAUNCHER_PANE\" | json_str)}\"); then\n" +
+            "          printf '%s\\n' \"$out\"\n" +
+            "          return\n" +
+            "        fi\n" +
+            "        case \"$out\" in\n" +
+            "          *'\"pane_not_found\"'*|*'\"pane_not_tiled\"'*) ;;\n" +
+            "          *) printf '%s\\n' \"$out\"; exit 1 ;;\n" +
+            "        esac\n" +
+            "      fi\n" +
+            "      api_print POST /v1/panes \"$body}\"\n" +
+            "      ;;\n" +
+            "    current)\n" +
+            "      if [ -z \"${TERMUX_LAUNCHER_PANE:-}\" ]; then\n" +
+            "        echo \"launcherctl pane current: this shell is not in a launcher pane (TERMUX_LAUNCHER_PANE is unset); use pane get <id>\" >&2\n" +
+            "        exit 2\n" +
+            "      fi\n" +
+            "      api GET \"/v1/panes/$TERMUX_LAUNCHER_PANE\"\n" +
+            "      ;;\n" +
+            "    get)\n" +
+            "      need_id \"usage: launcherctl pane get <id>\" \"${1:-}\"\n" +
+            "      api GET \"/v1/panes/$1\"\n" +
             "      ;;\n" +
             "    list|ls)\n" +
             "      api GET /v1/panes\n" +
             "      ;;\n" +
             "    focus|close)\n" +
-            "      [ \"$#\" -ge 1 ] || { echo \"usage: launcherctl pane $sub <id>\" >&2; exit 2; }\n" +
+            "      need_id \"usage: launcherctl pane $sub <id>\" \"${1:-}\"\n" +
             "      api POST \"/v1/panes/$1/$sub\" '{}'\n" +
             "      ;;\n" +
+            "    resize)\n" +
+            "      usage='usage: launcherctl pane resize <id> --size 0.1-0.9 | --columns N | --rows N'\n" +
+            "      [ \"$#\" -ge 3 ] || { echo \"$usage\" >&2; exit 2; }\n" +
+            "      need_id \"$usage\" \"$1\"\n" +
+            "      id=\"$1\"; shift\n" +
+            "      case \"$1\" in\n" +
+            "        --size|--columns|--rows) key=\"${1#--}\" ;;\n" +
+            "        *) echo \"$usage\" >&2; exit 2 ;;\n" +
+            "      esac\n" +
+            "      api POST \"/v1/panes/$id/resize\" \"{\\\"$key\\\":$(printf '%s' \"$2\" | json_str)}\"\n" +
+            "      ;;\n" +
             "    write)\n" +
-            "      [ \"$#\" -ge 1 ] || { echo \"usage: launcherctl pane write <id> [--enter] <text>\" >&2; exit 2; }\n" +
+            "      need_id \"usage: launcherctl pane write <id> [--enter] <text>\" \"${1:-}\"\n" +
             "      id=\"$1\"; shift\n" +
             "      enter=false\n" +
             "      if [ \"${1:-}\" = \"--enter\" ]; then enter=true; shift; fi\n" +
@@ -1890,23 +3446,301 @@ public class LauncherCtlApiServer {
             "      api POST \"/v1/panes/$id/write\" \"{\\\"text\\\":$text,\\\"enter\\\":$enter}\"\n" +
             "      ;;\n" +
             "    read)\n" +
-            "      [ \"$#\" -ge 1 ] || { echo \"usage: launcherctl pane read <id> [--lines N]\" >&2; exit 2; }\n" +
+            "      usage='usage: launcherctl pane read <id> [--lines N]'\n" +
+            "      need_id \"$usage\" \"${1:-}\"\n" +
             "      id=\"$1\"; shift\n" +
             "      lines=60\n" +
-            "      if [ \"${1:-}\" = \"--lines\" ]; then lines=\"$2\"; shift 2; fi\n" +
+            "      if [ \"${1:-}\" = \"--lines\" ]; then need_value \"$#\" \"$1\"; lines=\"$2\"; shift 2; fi\n" +
+            "      case \"$lines\" in ''|*[!0-9]*) echo \"$usage\" >&2; exit 2 ;; esac\n" +
             "      api GET \"/v1/panes/$id/text?lines=$lines\"\n" +
+            "      ;;\n" +
+            "    wait)\n" +
+            "      usage='usage: launcherctl pane wait <id> (--match TEXT | --regex RE) [--timeout MS] [--lines N]'\n" +
+            "      need_id \"$usage\" \"${1:-}\"\n" +
+            "      id=\"$1\"; shift\n" +
+            "      key= pattern= timeout=\"$WAIT_DEFAULT_MS\" lines=\n" +
+            "      while [ \"$#\" -gt 0 ]; do\n" +
+            "        case \"$1\" in\n" +
+            "          --match|--regex)\n" +
+            "            need_value \"$#\" \"$1\"\n" +
+            "            [ -z \"$key\" ] || { echo \"launcherctl pane wait: give --match or --regex, not both\" >&2; exit 2; }\n" +
+            "            key=\"${1#--}\"; pattern=\"$2\"; shift 2 ;;\n" +
+            "          --timeout) need_value \"$#\" \"$1\"; timeout=\"$2\"; shift 2 ;;\n" +
+            "          --lines) need_value \"$#\" \"$1\"; lines=\"$2\"; shift 2 ;;\n" +
+            "          *) echo \"launcherctl pane wait: unknown option $1\" >&2; echo \"$usage\" >&2; exit 2 ;;\n" +
+            "        esac\n" +
+            "      done\n" +
+            "      [ -n \"$key\" ] && [ -n \"$pattern\" ] || { echo \"$usage\" >&2; exit 2; }\n" +
+            "      case \"$timeout\" in\n" +
+            "        ''|*[!0-9]*) echo \"launcherctl pane wait: --timeout is milliseconds, 0 to $WAIT_MAX_MS\" >&2; exit 2 ;;\n" +
+            "      esac\n" +
+            "      timeout=$(no_zeros \"$timeout\")\n" +
+            "      if [ \"${#timeout}\" -gt 9 ] || [ \"$timeout\" -gt \"$WAIT_MAX_MS\" ]; then\n" +
+            "        echo \"launcherctl pane wait: --timeout is milliseconds, 0 to $WAIT_MAX_MS\" >&2\n" +
+            "        exit 2\n" +
+            "      fi\n" +
+            "      body=\"{\\\"$key\\\":$(printf '%s' \"$pattern\" | json_str),\\\"timeout_ms\\\":$timeout\"\n" +
+            "      if [ -n \"$lines\" ]; then\n" +
+            "        case \"$lines\" in ''|*[!0-9]*) echo \"launcherctl pane wait: --lines is a whole number\" >&2; exit 2 ;; esac\n" +
+            "        body=\"$body,\\\"lines\\\":$(printf '%s' \"$lines\" | json_str)\"\n" +
+            "      fi\n" +
+            "      # The answer only comes when the wait is over, so curl has to outlast it.\n" +
+            "      API_MAX_TIME=$((timeout / 1000 + 15))\n" +
+            "      api POST \"/v1/panes/$id/wait\" \"$body}\"\n" +
             "      ;;\n" +
             "    *)\n" +
             "      echo \"launcherctl pane: unknown command: $sub\" >&2\n" +
-            "      print_help >&2\n" +
+            "      group_help pane >&2\n" +
             "      exit 2\n" +
             "      ;;\n" +
             "  esac\n" +
             "}\n" +
+            "window_cmd() {\n" +
+            "  sub=\"${1:-}\"\n" +
+            "  usage='usage: launcherctl window open [--cwd DIR] [--title NAME] [--no-focus] [--print-id] [--] CMD ARGS... | list | focus <id> | close <id>'\n" +
+            "  [ -n \"$sub\" ] && shift || { group_help window >&2; exit 2; }\n" +
+            "  case \"${1:-}\" in -h|--help) group_help window; exit 0 ;; esac\n" +
+            "  case \"$sub\" in\n" +
+            "    list|ls)\n" +
+            "      api GET /v1/panes\n" +
+            "      ;;\n" +
+            "    focus|close)\n" +
+            "      need_id \"usage: launcherctl window $sub <id>\" \"${1:-}\"\n" +
+            "      api POST \"/v1/windows/$1/$sub\" '{}'\n" +
+            "      ;;\n" +
+            "    open)\n" +
+            "      # Without --cwd the window starts where this command runs, as for pane open.\n" +
+            "      title= focus=true cwd=\"${PWD:-}\" print=\n" +
+            "      while [ \"$#\" -gt 0 ]; do\n" +
+            "        case \"$1\" in\n" +
+            "          --cwd) need_value \"$#\" \"$1\"; cwd=\"$2\"; shift 2 ;;\n" +
+            "          --title) need_value \"$#\" \"$1\"; title=\"$2\"; shift 2 ;;\n" +
+            "          --no-focus) focus=false; shift ;;\n" +
+            "          --print-id) print=id; shift ;;\n" +
+            "          --) shift; break ;;\n" +
+            "          -*) echo \"launcherctl window open: unknown option $1\" >&2; exit 2 ;;\n" +
+            "          *) break ;;\n" +
+            "        esac\n" +
+            "      done\n" +
+            "      [ \"$#\" -gt 0 ] || { echo \"launcherctl window open: a command to run is required\" >&2; echo \"$usage\" >&2; exit 2; }\n" +
+            "      argv=\n" +
+            "      for a in \"$@\"; do\n" +
+            "        argv=\"$argv${argv:+,}$(printf '%s' \"$a\" | json_str)\"\n" +
+            "      done\n" +
+            "      body=\"{\\\"focus\\\":$focus,\\\"command\\\":[$argv]\"\n" +
+            "      [ -n \"$title\" ] && body=\"$body,\\\"title\\\":$(printf '%s' \"$title\" | json_str)\"\n" +
+            "      [ -n \"$cwd\" ] && body=\"$body,\\\"cwd\\\":$(printf '%s' \"$cwd\" | json_str)\"\n" +
+            "      [ -n \"$print\" ] && body=\"$body,\\\"print\\\":\\\"id\\\"\"\n" +
+            "      api_print POST /v1/windows \"$body}\"\n" +
+            "      ;;\n" +
+            "    *)\n" +
+            "      echo \"launcherctl window: unknown command: $sub\" >&2\n" +
+            "      group_help window >&2\n" +
+            "      exit 2\n" +
+            "      ;;\n" +
+            "  esac\n" +
+            "}\n" +
+            "notify_cmd() {\n" +
+            "  usage='usage: launcherctl notify [--title T] [--id ID] [--urgency low|normal|critical] [--pane ID] <body>'\n" +
+            "  title= id= urgency= close= pane=\"${TERMUX_LAUNCHER_PANE:-}\"\n" +
+            "  while [ \"$#\" -gt 0 ]; do\n" +
+            "    case \"$1\" in\n" +
+            "      --close) close=\"${2:-}\"; [ -n \"$close\" ] || { echo \"$usage\" >&2; exit 2; }; shift 2 ;;\n" +
+            "      --title) title=\"${2:-}\"; shift 2 ;;\n" +
+            "      --id) id=\"${2:-}\"; shift 2 ;;\n" +
+            "      --urgency) urgency=\"${2:-}\"; shift 2 ;;\n" +
+            "      --pane) pane=\"${2:-}\"; shift 2 ;;\n" +
+            "      --) shift; break ;;\n" +
+            "      -*) echo \"launcherctl notify: unknown option $1\" >&2; exit 2 ;;\n" +
+            "      *) break ;;\n" +
+            "    esac\n" +
+            "  done\n" +
+            "  case \"$urgency\" in\n" +
+            "    ''|low|normal|critical) ;;\n" +
+            "    *) echo \"launcherctl notify: --urgency must be low, normal or critical\" >&2; exit 2 ;;\n" +
+            "  esac\n" +
+            "  if [ -n \"$close\" ]; then\n" +
+            "    req=\"{\\\"close\\\":$(printf '%s' \"$close\" | json_str)\"\n" +
+            "    [ -n \"$pane\" ] && req=\"$req,\\\"pane\\\":$(printf '%s' \"$pane\" | json_str)\"\n" +
+            "    api POST /v1/notify \"$req}\"\n" +
+            "    return\n" +
+            "  fi\n" +
+            "  # The body is the arguments, or stdin when there are none (a file, a pipe).\n" +
+            "  if [ \"$#\" -gt 0 ]; then body=$(printf '%s' \"$*\" | json_str); else body=$(json_str); fi\n" +
+            "  if [ \"$body\" = '\"\"' ] && [ -z \"$title\" ]; then echo \"$usage\" >&2; exit 2; fi\n" +
+            "  req=\"{\\\"body\\\":$body\"\n" +
+            "  [ -n \"$title\" ] && req=\"$req,\\\"title\\\":$(printf '%s' \"$title\" | json_str)\"\n" +
+            "  [ -n \"$id\" ] && req=\"$req,\\\"id\\\":$(printf '%s' \"$id\" | json_str)\"\n" +
+            "  [ -n \"$urgency\" ] && req=\"$req,\\\"urgency\\\":\\\"$urgency\\\"\"\n" +
+            "  [ -n \"$pane\" ] && req=\"$req,\\\"pane\\\":$(printf '%s' \"$pane\" | json_str)\"\n" +
+            "  api POST /v1/notify \"$req}\"\n" +
+            "}\n" +
+            "progress_cmd() {\n" +
+            "  usage='usage: launcherctl progress <0-100|clear|error [PCT]|indeterminate|paused [PCT]> [--pane ID]'\n" +
+            "  arg=\"${1:-}\"\n" +
+            "  [ -n \"$arg\" ] || { echo \"$usage\" >&2; exit 2; }\n" +
+            "  shift\n" +
+            "  pane=\"${TERMUX_LAUNCHER_PANE:-}\" state= pct=\n" +
+            "  case \"$arg\" in\n" +
+            "    clear|indeterminate) state=\"$arg\" ;;\n" +
+            "    error|paused)\n" +
+            "      state=\"$arg\"\n" +
+            "      # An optional percentage may follow; without one the ring keeps its last value.\n" +
+            "      case \"${1:-}\" in ''|-*) ;; *) pct=\"$1\"; shift ;; esac\n" +
+            "      ;;\n" +
+            "    *[!0-9]*) echo \"$usage\" >&2; exit 2 ;;\n" +
+            "    *) state=normal; pct=\"$arg\" ;;\n" +
+            "  esac\n" +
+            "  while [ \"$#\" -gt 0 ]; do\n" +
+            "    case \"$1\" in\n" +
+            "      --pane) pane=\"${2:-}\"; shift 2 ;;\n" +
+            "      *) echo \"launcherctl progress: unknown option $1\" >&2; exit 2 ;;\n" +
+            "    esac\n" +
+            "  done\n" +
+            "  if [ -n \"$pct\" ]; then\n" +
+            "    case \"$pct\" in *[!0-9]*) echo \"launcherctl progress: percent must be 0-100, got: $pct\" >&2; exit 2 ;; esac\n" +
+            "    [ \"$pct\" -le 100 ] || { echo \"launcherctl progress: percent must be 0-100, got: $pct\" >&2; exit 2; }\n" +
+            "  fi\n" +
+            "  req=\"{\\\"state\\\":\\\"$state\\\"\"\n" +
+            "  [ -n \"$pct\" ] && req=\"$req,\\\"percent\\\":$pct\"\n" +
+            "  [ -n \"$pane\" ] && req=\"$req,\\\"pane\\\":$(printf '%s' \"$pane\" | json_str)\"\n" +
+            "  api POST /v1/progress \"$req}\"\n" +
+            "}\n" +
+            "clipboard_cmd() {\n" +
+            "  usage='usage: launcherctl clipboard copy [<text>] | launcherctl clipboard paste'\n" +
+            "  sub=\"${1:-}\"\n" +
+            "  [ -n \"$sub\" ] && shift || { echo \"$usage\" >&2; exit 2; }\n" +
+            "  case \"$sub\" in\n" +
+            "    copy)\n" +
+            "      if [ \"$#\" -gt 0 ]; then text=$(printf '%s' \"$*\" | json_str); else text=$(json_str); fi\n" +
+            "      api POST /v1/clipboard \"{\\\"text\\\":$text}\"\n" +
+            "      ;;\n" +
+            "    paste)\n" +
+            "      api GET /v1/clipboard\n" +
+            "      ;;\n" +
+            "    *) echo \"$usage\" >&2; exit 2 ;;\n" +
+            "  esac\n" +
+            "}\n" +
+            "# Percent-encodes every byte, so any app name or search text is safe in a query string.\n" +
+            "urlenc() {\n" +
+            "  printf '%s' \"$1\" | od -An -tx1 | tr -d '\\n' | sed 's/ /%/g'\n" +
+            "}\n" +
+            "notifications_cmd() {\n" +
+            "  usage='usage: launcherctl notifications [--app PKG|LABEL] [--since 7d|ISO] [--until 1d|ISO] [--query TEXT] [--limit N] [--json] | apps | active | clear [--app PKG|LABEL]'\n" +
+            "  what=list\n" +
+            "  case \"${1:-}\" in apps|active|clear) what=\"$1\"; shift ;; esac\n" +
+            "  app= since= upto= query= limit= json=false\n" +
+            "  while [ \"$#\" -gt 0 ]; do\n" +
+            "    case \"$1\" in\n" +
+            "      --app) [ \"$#\" -ge 2 ] || { echo \"$usage\" >&2; exit 2; }; app=\"$2\"; shift 2 ;;\n" +
+            "      --since) [ \"$#\" -ge 2 ] || { echo \"$usage\" >&2; exit 2; }; since=\"$2\"; shift 2 ;;\n" +
+            "      --until) [ \"$#\" -ge 2 ] || { echo \"$usage\" >&2; exit 2; }; upto=\"$2\"; shift 2 ;;\n" +
+            "      --query) [ \"$#\" -ge 2 ] || { echo \"$usage\" >&2; exit 2; }; query=\"$2\"; shift 2 ;;\n" +
+            "      --limit) [ \"$#\" -ge 2 ] || { echo \"$usage\" >&2; exit 2; }; limit=\"$2\"; shift 2 ;;\n" +
+            "      --json) json=true; shift ;;\n" +
+            "      *) echo \"launcherctl notifications: unknown option $1\" >&2; echo \"$usage\" >&2; exit 2 ;;\n" +
+            "    esac\n" +
+            "  done\n" +
+            "  if [ \"$what\" = clear ]; then\n" +
+            "    if [ -n \"$app\" ]; then api POST /v1/notifications/clear \"{\\\"app\\\":$(printf '%s' \"$app\" | json_str)}\"; else api POST /v1/notifications/clear '{}'; fi\n" +
+            "    return\n" +
+            "  fi\n" +
+            "  case \"$what\" in list) path=/v1/notifications ;; *) path=\"/v1/notifications/$what\" ;; esac\n" +
+            "  qs=\n" +
+            "  [ \"$json\" = true ] || qs=\"format=text\"\n" +
+            "  [ -z \"$app\" ] || qs=\"$qs${qs:+&}app=$(urlenc \"$app\")\"\n" +
+            "  [ -z \"$since\" ] || qs=\"$qs${qs:+&}since=$(urlenc \"$since\")\"\n" +
+            "  [ -z \"$upto\" ] || qs=\"$qs${qs:+&}until=$(urlenc \"$upto\")\"\n" +
+            "  [ -z \"$query\" ] || qs=\"$qs${qs:+&}query=$(urlenc \"$query\")\"\n" +
+            "  [ -z \"$limit\" ] || qs=\"$qs${qs:+&}limit=$(urlenc \"$limit\")\"\n" +
+            "  api GET \"$path${qs:+?$qs}\"\n" +
+            "}\n" +
+            "vibrate_cmd() {\n" +
+            "  usage='usage: launcherctl vibrate [-d MS] [--force]'\n" +
+            "  ms=1000 force=false\n" +
+            "  while [ \"$#\" -gt 0 ]; do\n" +
+            "    case \"$1\" in\n" +
+            "      -d|--duration_ms) ms=\"${2:-}\"; shift 2 || true ;;\n" +
+            "      -f|--force) force=true; shift ;;\n" +
+            "      *) echo \"$usage\" >&2; exit 2 ;;\n" +
+            "    esac\n" +
+            "  done\n" +
+            "  case \"$ms\" in ''|*[!0-9]*) echo \"launcherctl vibrate: duration must be milliseconds, got: $ms\" >&2; exit 2 ;; esac\n" +
+            "  api POST /v1/vibrate \"{\\\"duration_ms\\\":$ms,\\\"force\\\":$force}\"\n" +
+            "}\n" +
+            "torch_cmd() {\n" +
+            "  case \"${1:-}\" in\n" +
+            "    on) api POST /v1/torch '{\"on\":true}' ;;\n" +
+            "    off) api POST /v1/torch '{\"on\":false}' ;;\n" +
+            "    *) echo 'usage: launcherctl torch on|off' >&2; exit 2 ;;\n" +
+            "  esac\n" +
+            "}\n" +
+            "volume_cmd() {\n" +
+            "  if [ \"$#\" -eq 0 ]; then api GET /v1/volume; return; fi\n" +
+            "  [ \"$#\" -eq 2 ] || { echo 'usage: launcherctl volume [STREAM VALUE]' >&2; exit 2; }\n" +
+            "  case \"$2\" in ''|*[!0-9]*) echo \"launcherctl volume: value must be a whole number, got: $2\" >&2; exit 2 ;; esac\n" +
+            "  api POST /v1/volume \"{\\\"stream\\\":$(printf '%s' \"$1\" | json_str),\\\"volume\\\":$2}\"\n" +
+            "}\n" +
+            "wallpaper_cmd() {\n" +
+            "  usage='usage: launcherctl wallpaper set FILE [--home|--lock|--both] | get'\n" +
+            "  case \"${1:-}\" in\n" +
+            "    get) api GET /v1/wallpaper; return ;;\n" +
+            "    set) shift ;;\n" +
+            "    *) echo \"$usage\" >&2; exit 2 ;;\n" +
+            "  esac\n" +
+            "  target=both file=''\n" +
+            "  while [ \"$#\" -gt 0 ]; do\n" +
+            "    case \"$1\" in\n" +
+            "      --home) target=home; shift ;;\n" +
+            "      --lock) target=lock; shift ;;\n" +
+            "      --both) target=both; shift ;;\n" +
+            "      --) shift; file=\"${1:-}\"; break ;;\n" +
+            "      -*) echo \"launcherctl wallpaper: unknown option $1\" >&2; exit 2 ;;\n" +
+            "      *) [ -z \"$file\" ] || { echo \"$usage\" >&2; exit 2; }; file=\"$1\"; shift ;;\n" +
+            "    esac\n" +
+            "  done\n" +
+            "  [ -n \"$file\" ] || { echo \"$usage\" >&2; exit 2; }\n" +
+            "  case \"$file\" in /*) ;; *) file=\"$PWD/$file\" ;; esac\n" +
+            "  [ -f \"$file\" ] || { echo \"launcherctl wallpaper: no such file: $file\" >&2; exit 2; }\n" +
+            "  path=$(printf '%s' \"$file\" | json_str)\n" +
+            "  api POST /v1/wallpaper \"{\\\"path\\\":$path,\\\"target\\\":\\\"$target\\\"}\"\n" +
+            "}\n" +
+            "toast_cmd() {\n" +
+            "  usage='usage: launcherctl toast [--short] <text>'\n" +
+            "  short=false\n" +
+            "  while [ \"$#\" -gt 0 ]; do\n" +
+            "    case \"$1\" in\n" +
+            "      -s|--short) short=true; shift ;;\n" +
+            "      --) shift; break ;;\n" +
+            "      -*) echo \"launcherctl toast: unknown option $1\" >&2; exit 2 ;;\n" +
+            "      *) break ;;\n" +
+            "    esac\n" +
+            "  done\n" +
+            "  if [ \"$#\" -gt 0 ]; then text=$(printf '%s' \"$*\" | json_str); else text=$(json_str); fi\n" +
+            "  if [ \"$text\" = '\"\"' ]; then echo \"$usage\" >&2; exit 2; fi\n" +
+            "  api POST /v1/toast \"{\\\"text\\\":$text,\\\"short\\\":$short}\"\n" +
+            "}\n" +
             "cmd=\"${1:-help}\"\n" +
+            "# launcherctl <group> --help prints that group's help. A group that only works with a\n" +
+            "# command prints the same help to stderr and exits 2 when given none, rather than acting.\n" +
+            "case \"${2:-}\" in\n" +
+            "  -h|--help) group_help \"$cmd\" && exit 0 ;;\n" +
+            "esac\n" +
+            "if [ \"$#\" -eq 1 ]; then\n" +
+            "  case \"$cmd\" in\n" +
+            "    launch|pane|window|agent|progress|clipboard|keyboard|torch|wallpaper|x11)\n" +
+            "      group_help \"$cmd\" >&2\n" +
+            "      exit 2\n" +
+            "      ;;\n" +
+            "  esac\n" +
+            "fi\n" +
             "case \"$cmd\" in\n" +
             "  -h|--help|help)\n" +
-            "    print_help\n" +
+            "    if [ \"$#\" -ge 2 ]; then\n" +
+            "      group_help \"$2\" || { echo \"launcherctl: no such group: $2\" >&2; exit 2; }\n" +
+            "    else\n" +
+            "      print_help\n" +
+            "    fi\n" +
             "    ;;\n" +
             "  launch)\n" +
             "    shift || true\n" +
@@ -1921,21 +3755,72 @@ public class LauncherCtlApiServer {
             "    shift || true\n" +
             "    pane_cmd \"$@\"\n" +
             "    ;;\n" +
+            "  window)\n" +
+            "    shift || true\n" +
+            "    window_cmd \"$@\"\n" +
+            "    ;;\n" +
             "  agent)\n" +
             "    shift || true\n" +
             "    agent_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  notify)\n" +
+            "    shift || true\n" +
+            "    notify_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  progress)\n" +
+            "    shift || true\n" +
+            "    progress_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  clipboard)\n" +
+            "    shift || true\n" +
+            "    clipboard_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  notifications)\n" +
+            "    shift || true\n" +
+            "    notifications_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  vibrate)\n" +
+            "    shift || true\n" +
+            "    vibrate_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  torch)\n" +
+            "    shift || true\n" +
+            "    torch_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  battery)\n" +
+            "    api GET /v1/battery\n" +
+            "    ;;\n" +
+            "  volume)\n" +
+            "    shift || true\n" +
+            "    volume_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  toast)\n" +
+            "    shift || true\n" +
+            "    toast_cmd \"$@\"\n" +
+            "    ;;\n" +
+            "  wallpaper)\n" +
+            "    shift || true\n" +
+            "    wallpaper_cmd \"$@\"\n" +
             "    ;;\n" +
             "  keyboard)\n" +
             "    shift || true\n" +
             "    sub=\"${1:-}\"\n" +
             "    [ \"$sub\" = show ] || [ \"$sub\" = hide ] || \\\n" +
-            "      { echo \"usage: launcherctl keyboard show|hide [--source manual|focus]\" >&2; exit 2; }\n" +
+            "      { echo \"usage: launcherctl keyboard show|hide [--source manual|focus] [--hold]\" >&2; exit 2; }\n" +
             "    shift || true\n" +
-            "    source=manual\n" +
-            "    if [ \"${1:-}\" = \"--source\" ]; then source=\"${2:-}\"; shift 2 || true; fi\n" +
+            "    source=manual hold=false\n" +
+            "    while [ \"$#\" -gt 0 ]; do\n" +
+            "      case \"$1\" in\n" +
+            "        --source) source=\"${2:-}\"; shift 2 || true ;;\n" +
+            "        --hold) hold=true; shift ;;\n" +
+            "        *) echo \"launcherctl keyboard: unknown option $1\" >&2; exit 2 ;;\n" +
+            "      esac\n" +
+            "    done\n" +
             "    [ \"$source\" = manual ] || [ \"$source\" = focus ] || \\\n" +
             "      { echo \"launcherctl keyboard: --source must be manual or focus\" >&2; exit 2; }\n" +
-            "    api POST \"/v1/keyboard/$sub\" \"{\\\"source\\\":\\\"$source\\\"}\"\n" +
+            "    # --hold only means anything on hide: it asks the launcher to keep the keyboard\n" +
+            "    # down until this same shell either shows it again or ends, not for one call.\n" +
+            "    api POST \"/v1/keyboard/$sub\" \"{\\\"source\\\":\\\"$source\\\",\\\"hold\\\":$hold}\"\n" +
             "    ;;\n" +
             "  x11)\n" +
             "    shift || true\n" +
@@ -1950,18 +3835,10 @@ public class LauncherCtlApiServer {
             "    ;;\n" +
             "  *)\n" +
             "    echo \"launcherctl: unknown command: $cmd\" >&2\n" +
-            "    echo \"launcherctl supports: launch, pane, agent, keyboard, x11. For local AI use tai.\" >&2\n" +
+            "    echo \"launcherctl supports: launch, pane, window, agent, notify, progress, clipboard, notifications, keyboard, vibrate, torch, battery, volume, toast, wallpaper, x11. For local AI use tai.\" >&2\n" +
             "    exit 2\n" +
             "    ;;\n" +
             "esac\n";
-
-        try {
-            writeExecutableTextFile(TAI_BIN_PATH, taiScript);
-            writeExecutableTextFile(LAUNCHERCTL_BIN_PATH, launcherctlScript);
-            deleteLegacyHelperScripts();
-        } catch (Exception e) {
-            Logger.logErrorExtended(LOG_TAG, "Failed to install TAI cli: " + e.getMessage());
-        }
     }
 
     /**
@@ -1998,26 +3875,91 @@ public class LauncherCtlApiServer {
         file.setWritable(true, true);
     }
 
+    /** The mode {@link #writeExecutableTextFile} leaves behind: owner rw, everyone r and x. */
+    private static final int EXECUTABLE_SCRIPT_MODE = 0755;
+
+    /**
+     * Installs a CLI script, unless the one there already has this content and mode: every start
+     * of the server and every bootstrap callback asks, and the tai script alone is a thousand
+     * lines, so an unchanged install costs a stat and a read instead of a rewrite and four chmods.
+     */
     private void writeExecutableTextFile(String path, String content) throws IOException {
-        writeTextFile(path, content);
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         File file = new File(path);
+        if (hasContent(file, bytes) && hasMode(file, EXECUTABLE_SCRIPT_MODE)) return;
+        writeTextFile(path, content);
         if (file.exists()) {
             file.setExecutable(true, false);
             file.setReadable(true, false);
         }
     }
 
+    /** True when {@code file} is a regular file holding exactly {@code expected}. */
+    static boolean hasContent(@NonNull File file, @NonNull byte[] expected) {
+        if (!file.isFile() || file.length() != expected.length) return false;
+        byte[] actual = new byte[expected.length];
+        try (InputStream input = new java.io.FileInputStream(file)) {
+            int offset = 0;
+            while (offset < actual.length) {
+                int count = input.read(actual, offset, actual.length - offset);
+                if (count < 0) return false;
+                offset += count;
+            }
+            // Longer than it said a moment ago: it is being written, so it is not ours yet.
+            if (input.read() != -1) return false;
+        } catch (IOException e) {
+            return false;
+        }
+        return java.util.Arrays.equals(actual, expected);
+    }
+
+    /** True when {@code file}'s permission bits are exactly {@code mode}; false when unknown. */
+    private static boolean hasMode(@NonNull File file, int mode) {
+        try {
+            return (android.system.Os.stat(file.getAbsolutePath()).st_mode & 07777) == mode;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Stores the tier override ({@code auto}, 1, 2 or 3) and answers with the tier it gives now. */
+    private JSONObject setTierOverride(Context context, @Nullable String body) throws JSONException {
+        JSONObject request = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);
+        String value = request.optString("tier", "").trim().toLowerCase(Locale.ROOT);
+        if (!"auto".equals(value) && !"1".equals(value) && !"2".equals(value) && !"3".equals(value)) {
+            return statusError(400, "bad_request", "tier must be 1, 2, 3 or auto.");
+        }
+        TaiSettings settings = new TaiSettings(context);
+        settings.setTierOverride(value);
+        JSONObject response = new JSONObject();
+        response.put("ok", true);
+        response.put("tierOverride", settings.getTierOverrideValue());
+        // Read-only here: Settings, TAI, Advanced, Memory limits is where it changes.
+        response.put("memoryMode", settings.getMemoryMode().id);
+        response.put("tier", com.termux.ai.TaiDeviceTier.forDevice(context).number());
+        return response;
+    }
+
     private HttpResponse jsonResponse(JSONObject response) {
         int statusCode = response.optInt("_statusCode", 200);
         response.remove("_statusCode");
+        // A handler (embeddings' insufficient-memory refusal, e.g.) may ask for a Retry-After header
+        // without going through the rate limiter; see TaiManager's embedding_memory / 503 refusal.
+        int retryAfterSeconds = response.optInt("_retryAfterSeconds", 0);
+        response.remove("_retryAfterSeconds");
         if (statusCode >= 400 || (!response.optBoolean("ok", true) && response.has("error"))) {
             try {
                 withOpenAiErrorEnvelope(response, statusCode);
             } catch (JSONException ignored) {
             }
         }
+        Map<String, String> headers = null;
+        if (retryAfterSeconds > 0) {
+            headers = new HashMap<>();
+            headers.put("Retry-After", Integer.toString(retryAfterSeconds));
+        }
         return new HttpResponse(statusCode, "application/json; charset=utf-8",
-            response.toString().getBytes(StandardCharsets.UTF_8), null);
+            response.toString().getBytes(StandardCharsets.UTF_8), headers);
     }
 
     static HttpResponse ollamaJsonResponse(JSONObject response) throws JSONException {
@@ -2044,6 +3986,14 @@ public class LauncherCtlApiServer {
         headers.put("Cache-Control", "no-cache");
         headers.put("X-Accel-Buffering", "no");
         return new HttpResponse(200, "application/x-ndjson; charset=utf-8", bodyWriter, headers);
+    }
+
+    /** Plain text written line by line as it happens: what {@code tai benchmark} prints live. */
+    private HttpResponse textStreamResponse(BodyWriter bodyWriter) {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Cache-Control", "no-cache");
+        headers.put("X-Accel-Buffering", "no");
+        return new HttpResponse(200, "text/plain; charset=utf-8", bodyWriter, headers);
     }
 
     private void writeResponsesStream(Context context, String chatBody, OutputStream output) throws IOException {
@@ -2223,6 +4173,48 @@ public class LauncherCtlApiServer {
         }
     }
 
+    /** Bench v1 events as SSE, one {@code data:} line per event, ended by {@code [DONE]}. */
+    private void writeBenchStream(Context context, String body, OutputStream output) throws IOException {
+        try {
+            TaiManager.getInstance(context).benchRun(body, new TaiManager.OpenAiStreamSink() {
+                @Override
+                public void onEvent(@NonNull JSONObject event) throws IOException {
+                    writeSseEvent(output, event.toString());
+                }
+
+                @Override
+                public void onDone() throws IOException {
+                    writeSseEvent(output, "[DONE]");
+                }
+            });
+        } catch (JSONException e) {
+            writeSseJsonError(output, "internal_error", e.getMessage());
+            writeSseEvent(output, "[DONE]");
+        }
+    }
+
+    /** The same events as the lines {@code tai benchmark} shows; token events are not printed. */
+    private void writeBenchTextStream(Context context, String body, OutputStream output) throws IOException {
+        try {
+            TaiManager.getInstance(context).benchRun(body, new TaiManager.OpenAiStreamSink() {
+                @Override
+                public void onEvent(@NonNull JSONObject event) throws IOException {
+                    String line = TaiCliFormatter.formatBenchEvent(event);
+                    if (line == null) return;
+                    output.write(line.getBytes(StandardCharsets.UTF_8));
+                    output.flush();
+                }
+
+                @Override
+                public void onDone() {
+                }
+            });
+        } catch (JSONException e) {
+            output.write(("  error: " + e.getMessage() + "\n").getBytes(StandardCharsets.UTF_8));
+            output.flush();
+        }
+    }
+
     private void writeCompletionStream(Context context, String body, OutputStream output) throws IOException {
         try {
             TaiManager.getInstance(context).openAiCompletionsStream(body, new TaiManager.OpenAiStreamSink() {
@@ -2300,6 +4292,8 @@ public class LauncherCtlApiServer {
         String query;
         Map<String, String> headers;
         String body;
+        /** The body as received; multipart uploads are read from here, never from the decoded string. */
+        byte[] bodyBytes = new byte[0];
     }
 
     static class HttpResponse {

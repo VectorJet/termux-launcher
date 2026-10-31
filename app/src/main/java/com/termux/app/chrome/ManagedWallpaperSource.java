@@ -101,9 +101,69 @@ public final class ManagedWallpaperSource {
         return mReadingKey != null;
     }
 
+    /** The identity of the file whose pixel size {@link #mSizeWidth} and {@link #mSizeHeight} hold. */
+    @Nullable private String mSizeKey;
+    private int mSizeWidth, mSizeHeight;
+
+    /**
+     * The stored picture's pixel size, read from the file's header on the calling thread and
+     * remembered per file identity, so it costs one header read per wallpaper rather than one
+     * per ask. It decides how wide the frame the picture is decoded into has to be — a picture
+     * cropped one and a half screens wide pans, one cropped a screen wide does not — which has to
+     * be known before {@link #obtain} can be asked for that frame. Returns false, and 0s, when the
+     * file cannot be read.
+     */
+    public boolean readSize(@NonNull File file, @NonNull int[] outWidthHeight) {
+        String key = identity(file.getAbsolutePath(), file.lastModified(), file.length(), 0, 0);
+        if (!key.equals(mSizeKey)) {
+            mSizeKey = key;
+            mSizeWidth = 0;
+            mSizeHeight = 0;
+            if (file.isFile()) {
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                    mSizeWidth = bounds.outWidth;
+                    mSizeHeight = bounds.outHeight;
+                }
+            }
+        }
+        outWidthHeight[0] = mSizeWidth;
+        outWidthHeight[1] = mSizeHeight;
+        return mSizeWidth > 0 && mSizeHeight > 0;
+    }
+
+    /**
+     * Bitmaps lent out to a reader off the main thread (the blur worker drawing the wallpaper into
+     * a capture), with how many loans each has out. A lent bitmap is not recycled under its reader:
+     * {@link #clear} leaves it to the last {@link #release}.
+     */
+    @NonNull private final java.util.IdentityHashMap<Bitmap, Integer> mLoans =
+        new java.util.IdentityHashMap<>();
+
+    /** Main thread: lends {@code bitmap} (one {@link #obtain} returned) to a reader on another thread. */
+    public void lend(@NonNull Bitmap bitmap) {
+        Integer loans = mLoans.get(bitmap);
+        mLoans.put(bitmap, loans == null ? 1 : loans + 1);
+    }
+
+    /** Main thread: the reader is done; a bitmap cleared meanwhile is recycled with the last loan. */
+    public void release(@NonNull Bitmap bitmap) {
+        Integer loans = mLoans.get(bitmap);
+        if (loans == null) return;
+        if (loans > 1) {
+            mLoans.put(bitmap, loans - 1);
+            return;
+        }
+        mLoans.remove(bitmap);
+        if (bitmap != mBitmap && !bitmap.isRecycled()) bitmap.recycle();
+    }
+
     /** Drops the held bitmap; the next call reads again. */
     public void clear() {
-        if (mBitmap != null && !mBitmap.isRecycled()) mBitmap.recycle();
+        if (mBitmap != null && !mBitmap.isRecycled() && !mLoans.containsKey(mBitmap))
+            mBitmap.recycle();
         mBitmap = null;
         mPath = null;
     }

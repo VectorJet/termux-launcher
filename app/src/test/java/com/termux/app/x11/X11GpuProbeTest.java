@@ -46,6 +46,34 @@ public class X11GpuProbeTest {
         assertTrue(result.toEnv().contains("export MESA_LOADER_DRIVER_OVERRIDE=zink\n"));
     }
 
+    /** The Setup GUI Apps screen's second command: the install first, the exports after it. */
+    @Test public void theGraphicsCommandInstallsFirstAndEndsWithoutANewline() {
+        X11GpuProbe.Inputs in = new X11GpuProbe.Inputs();
+        in.kgsl = true;
+        in.kgslModel = "Adreno730v2";
+
+        String command = X11GpuProbe.evaluate(in).toCommand();
+
+        String[] lines = command.split("\n", -1);
+        assertEquals("# Adreno730v2: turnip-zink", lines[0]);
+        assertEquals("pkg install -y mesa mesa-vulkan-icd-freedreno", lines[1]);
+        assertEquals("export MESA_LOADER_DRIVER_OVERRIDE=zink", lines[lines.length - 2]);
+        assertEquals("export TU_DEBUG=noconform", lines[lines.length - 1]);
+        assertFalse("the user's own Enter runs the last line", command.endsWith("\n"));
+    }
+
+    /** virgl needs a helper alive in Termux, and the command has to say so. */
+    @Test public void theGraphicsCommandNamesTheHelperWhenTheProfileNeedsOne() {
+        X11GpuProbe.Inputs in = new X11GpuProbe.Inputs();
+        in.eglVendor = "mali";
+        in.glRenderer = "Mali-G78";
+
+        String command = X11GpuProbe.evaluate(in).toCommand();
+
+        assertTrue(command, command.contains("# then keep this running in Termux: "
+            + "virgl_test_server_android --angle-gl &"));
+    }
+
     @Test public void adrenoWithoutThePackagesStillRecommendsZinkAndNamesThem() {
         X11GpuProbe.Inputs in = new X11GpuProbe.Inputs();
         in.kgsl = true;
@@ -129,6 +157,13 @@ public class X11GpuProbeTest {
         assertEquals("somevendor", X11GpuProbe.evaluate(in).gpu);
     }
 
+    /** Mesa picks Zink on any Vulkan driver unless told not to, and then ignores virpipe. */
+    @Test public void virglKeepsMesaOffZink() {
+        X11GpuProbe.Inputs in = new X11GpuProbe.Inputs();
+        in.eglVendor = "somevendor";
+        assertTrue(X11GpuProbe.evaluate(in).ranked.get(0).env.contains("LIBGL_KOPPER_DISABLE=1"));
+    }
+
     @Test public void theJsonCarriesEveryProfileAndTheEnvText() throws Exception {
         X11GpuProbe.Inputs in = new X11GpuProbe.Inputs();
         in.kgsl = true;
@@ -138,5 +173,35 @@ public class X11GpuProbeTest {
         assertEquals("turnip-zink", json.getString("recommended"));
         assertEquals(4, json.getJSONArray("profiles").length());
         assertTrue(json.getString("env_text").startsWith("# "));
+    }
+
+    @Test public void aKnownFreezeGpuRanksSoftwareFirstAndWarnsOnVirgl() {
+        X11GpuProbe.Inputs in = new X11GpuProbe.Inputs();
+        in.eglVendor = "mali";
+        in.glRenderer = "Mali-G52 MC2";
+        in.virglServer = true;
+        in.angle = true;
+        in.mesaDri = true;
+
+        X11GpuProbe.Result result = X11GpuProbe.evaluate(in);
+        assertEquals("software", result.ranked.get(0).profile.id);
+        assertTrue(result.ranked.get(0).installed);
+        assertNull("software is what the row recommends", result.recommended());
+        boolean warned = false;
+        for (X11GpuProbe.Recommendation r : result.ranked) {
+            if (r.profile == X11GpuProbe.Profile.VIRGL_ANGLE || r.profile == X11GpuProbe.Profile.VIRGL) {
+                assertTrue(r.reason, r.reason.contains("frozen the whole phone"));
+                warned = true;
+            }
+        }
+        assertTrue(warned);
+        assertTrue(X11GpuProbe.knownFreeze(in));
+        in.glRenderer = "Mali-G78";
+        assertFalse(X11GpuProbe.knownFreeze(in));
+        // The GL probe may say nothing (a failed throwaway context): the chip name still matches.
+        in.glRenderer = "";
+        in.board = "mt6768";
+        assertTrue(X11GpuProbe.knownFreeze(in));
+        assertEquals("software", X11GpuProbe.evaluate(in).ranked.get(0).profile.id);
     }
 }
